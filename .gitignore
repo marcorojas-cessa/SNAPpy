@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+.venv/
+build/
+dist/
+htmlcov/
+
+# Research artifacts should stay outside the public package.
+datasets/
+runs/
+reports/
+cluster_results/
+tmp/
+*.tif
+*.tiff
+*.nd2

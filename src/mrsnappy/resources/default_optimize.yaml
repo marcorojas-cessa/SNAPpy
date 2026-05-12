@@ -1,0 +1,114 @@
+# Initialized SNAPpy optimizer config.
+# Copy with: mrsnappy init-config --output config.yaml
+# Run with:  mrsnappy optimize --train-dir /path/to/labeled_dataset --out-dir /path/to/model --config config.yaml
+
+# Short name written into output metadata.
+dataset_name: mrsnappy_dataset
+
+# Usually supplied by --train-dir. Expected folder contains train/ and val/.
+dataset_root: null
+
+# Candidate-to-ground-truth matching distance in voxel units.
+match_distance: 4.0
+
+# Stage 1 candidate generation.
+# Expected: log or hmax. To fully customize detection, replace this with an
+# explicit stage1_recipes list using the same parameter names shown below.
+stage1_detector_set: log
+
+# 3D Gaussian smoothing sigmas in voxel units.
+stage1_smoothing_sigmas: [0.5, 1.0, 2.0]
+
+# Include recipes without background correction.
+stage1_background_include_off: true
+
+# Expected: rolling_box_3d, rolling_ball_2d, or rolling_ball_3d.
+stage1_background_method: rolling_box_3d
+
+# Background radii in voxel units.
+stage1_background_params: [5.0, 10.0]
+
+# Stage 1 pass/fail guardrails and ranking into Stage 2.
+preflight:
+  # Number of validation images used for the fast Stage 1 screen.
+  # Stage 2 validation still uses the full val/ split.
+  stage1_n_val_images: 4
+
+  # Minimum Stage 1 recall required before a recipe can enter Stage 2.
+  min_stage1_recall: 0.25
+
+  # Maximum mean candidates per preflight image.
+  max_stage1_candidates_mean: 2500
+
+  # Maximum candidates allowed in any single preflight image.
+  max_stage1_candidates_single: 4000
+
+  # Optional mean candidate/GT cap. null lets SNAPpy choose from dataset density.
+  max_stage1_candidates_per_label_mean: null
+  auto_candidate_ratio_cap_enabled: true
+  auto_candidate_ratio_caps:
+    sparse: 130.0
+    moderate: 100.0
+    dense: 70.0
+  # Contrast here means GT puncta intensity relative to local image background/noise.
+  auto_candidate_ratio_low_contrast_multiplier: 1.25
+  auto_candidate_ratio_high_contrast_multiplier: 0.85
+
+optimizer:
+  # Number of passing Stage 1 recipes expanded into Stage 2.
+  shortlist_top_k: 3
+
+  # Recipes within this F1 of the best validation F1 are treated as near-ties.
+  selection_margin: 0.005
+
+  # Safety caps to prevent accidental huge sweeps.
+  max_stage1_preflight_configs: 1000
+  max_stage2_recipes_after_shortlist: 100
+
+exports:
+  # Same as CLI flag --export-optimize-report.
+  export_optimize_report: false
+
+  # Same as CLI flag --export-candidate-features.
+  export_candidate_features: false
+
+# Stage 2 model/feature tuning.
+# Expected entries: base_only, curated_balanced, shape_localization, distortion,
+# intensity_quality, model_evidence, full.
+stage2_feature_packs:
+  - base_only
+  - curated_balanced
+  - shape_localization
+  - distortion
+  - intensity_quality
+  - model_evidence
+  - full
+# Local fitting variants swept during Stage 2.
+# Expected: xy_z_gaussian, gaussian_3d, distorted_gaussian_3d.
+stage2_fit_variants:
+  - xy_z_gaussian
+
+# SVM hyperparameter sweep.
+svm_sweep:
+  kernels: [linear, rbf, polynomial]
+  box_constraints: [0.01, 0.1, 1.0, 10.0, 100.0]
+  # RBF/poly gamma values. auto lets scikit-learn choose 1 / n_features.
+  kernel_scales: [auto, 1.0]
+  polynomial_orders: [2, 3]
+  standardize: true
+  # balanced weights positives/negatives inversely to class frequency; none disables weighting.
+  class_weight_mode: balanced
+  # null means no manually supplied class-weight dictionary.
+  class_weights: null
+
+# In-memory cache sizes. These affect runtime only; they do not change the model.
+runtime_cache:
+  # Stores processed/smoothed 3D volumes shared across Stage 1 recipes.
+  # 96 covers the default 4-image Stage 1 screen plus most 100% development Stage 2 sweeps.
+  preprocess_cache_entries: 96
+  # Stores Stage 1 candidate coordinates/scores only, not full image volumes.
+  stage1_cache_enabled: true
+  stage1_cache_entries: 128
+  # Stores fitted candidate feature tables reused across feature-pack/SVM sweeps.
+  fit_cache_enabled: true
+  fit_cache_entries: 512
