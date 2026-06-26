@@ -2,9 +2,23 @@
 
 SNAPpy installs like a standard Python package. The command users run after installation is `mrsnappy`.
 
-## Recommended Install
+## Current GitHub Install
 
-Install SNAPpy from PyPI with:
+Use this command to install the current GitHub version:
+
+```bash
+python -m pip install "git+https://github.com/marcorojas-cessa/SNAPpy.git"
+```
+
+Confirm the install:
+
+```bash
+mrsnappy --help
+```
+
+## PyPI Install
+
+Install the latest published PyPI release with:
 
 ```bash
 python -m pip install mrsnappy
@@ -16,11 +30,8 @@ Confirm the install:
 mrsnappy --help
 ```
 
-To install the current GitHub version instead of the PyPI release:
-
-```bash
-python -m pip install "git+https://github.com/marcorojas-cessa/SNAPpy.git"
-```
+The PyPI release may lag behind the current GitHub source. For publication
+benchmark reproduction before a new PyPI release, use the GitHub install.
 
 ## Clean Environment Install
 
@@ -30,7 +41,7 @@ Use a virtual environment if you want SNAPpy isolated from your system Python:
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install mrsnappy
+python -m pip install "git+https://github.com/marcorojas-cessa/SNAPpy.git"
 ```
 
 SNAPpy does not require a GPU. For routine detection, use a modern CPU-only computer with at least 8-16 GB RAM; 16 GB or more is recommended for larger z-stacks or batch processing. See [hardware guidance](hardware.md) for details.

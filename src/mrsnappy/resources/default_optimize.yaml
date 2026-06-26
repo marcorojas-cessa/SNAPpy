@@ -1,114 +1,147 @@
 # Initialized SNAPpy optimizer config.
 # Copy with: mrsnappy init-config --output config.yaml
-# Run with:  mrsnappy optimize --train-dir /path/to/labeled_dataset --out-dir /path/to/model --config config.yaml
+# Run with:  mrsnappy optimize --dataset-root /path/to/labeled_dataset --out-dir /path/to/model --config config.yaml
 
 # Short name written into output metadata.
 dataset_name: mrsnappy_dataset
 
-# Usually supplied by --train-dir. Expected folder contains train/ and val/.
+# Current implemented mode. fixed_split means dataset_root contains train/ and val/.
+# cross_validation is planned for a future release and will use the same
+# --dataset-root argument with SNAPpy-generated folds.
+optimization_mode: fixed_split
+
+# Usually supplied by --dataset-root. In fixed_split mode, this folder contains train/ and val/.
 dataset_root: null
 
 # Candidate-to-ground-truth matching distance in voxel units.
-match_distance: 4.0
+match_distance: 3.0
+
+# Optional alternative: use physical candidate-to-ground-truth matching in
+# nanometers. Do not set both match_distance and match_distance_nm.
+# match_distance_nm: 386.598
 
 # Stage 1 candidate generation.
 # Expected: log or hmax. To fully customize detection, replace this with an
 # explicit stage1_recipes list using the same parameter names shown below.
-stage1_detector_set: log
+#
+# Matrix list fields are literal: only values present in this config are swept.
+# Omitted list fields are treated as empty once a Stage 1 matrix is declared.
+stage1_detector_set: hmax
 
-# 3D Gaussian smoothing sigmas in voxel units.
-stage1_smoothing_sigmas: [0.5, 1.0, 2.0]
+# Voxel-space LoG and local-maximum sweep. Physical-unit fields can be added
+# alongside these to produce additional recipes:
+# stage1_log_sigmas_nm: [130.0, 200.0, 260.0]
+# stage1_maxima_min_distances_nm: [130.0, 260.0]
+stage1_log_sigmas: [1.0, 2.0, 3.0]
+stage1_log_thresholds: [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0]
+stage1_maxima_neighborhoods: [1, 2]
 
-# Include recipes without background correction.
-stage1_background_include_off: true
+# Used when stage1_detector_set is hmax.
+stage1_hmax_multipliers: [0.1, 0.25, 0.5, 1.0, 1.5, 2.0]
 
-# Expected: rolling_box_3d, rolling_ball_2d, or rolling_ball_3d.
+# 3D Gaussian smoothing sigmas in voxel units. The literal value off includes
+# an unsmoothed Stage 1 recipe. Add stage1_smoothing_sigmas_nm to sweep
+# physical-unit smoothing in addition to these voxel recipes.
+stage1_smoothing_sigmas: ["off", 0.5, 1.0, 2.0]
+
+# Expected: rolling_box_3d, slice_opening_2d, rolling_ball_2d, or rolling_ball_3d.
 stage1_background_method: rolling_box_3d
 
-# Background radii in voxel units.
-stage1_background_params: [5.0, 10.0]
+# Background radii in voxel units. The literal value off includes recipes
+# without background correction. Add stage1_background_params_nm to sweep
+# physical-unit background radii in addition to these voxel recipes.
+stage1_background_params: ["off", 5.0, 10.0]
 
 # Stage 1 pass/fail guardrails and ranking into Stage 2.
 preflight:
   # Number of validation images used for the fast Stage 1 screen.
+  # Use a positive integer or all.
   # Stage 2 validation still uses the full val/ split.
-  stage1_n_val_images: 4
+  stage1_n_val_images: 5
 
-  # Minimum Stage 1 recall required before a recipe can enter Stage 2.
-  min_stage1_recall: 0.25
+  # Minimum mean Stage 1 recall across preflight validation images required
+  # before a recipe can enter Stage 2.
+  min_stage1_recall_mean: 0.4
 
   # Maximum mean candidates per preflight image.
   max_stage1_candidates_mean: 2500
 
   # Maximum candidates allowed in any single preflight image.
-  max_stage1_candidates_single: 4000
+  max_stage1_candidates_single: 5000
 
-  # Optional mean candidate/GT cap. null lets SNAPpy choose from dataset density.
-  max_stage1_candidates_per_label_mean: null
-  auto_candidate_ratio_cap_enabled: true
-  auto_candidate_ratio_caps:
-    sparse: 130.0
-    moderate: 100.0
-    dense: 70.0
-  # Contrast here means GT puncta intensity relative to local image background/noise.
-  auto_candidate_ratio_low_contrast_multiplier: 1.25
-  auto_candidate_ratio_high_contrast_multiplier: 0.85
+  # Candidate/GT ratio guardrail.
+  # The ratio is averaged per image as n_candidates / max(n_ground_truth, 1).
+  max_candidate_ratio_cap_mean: 500.0
+
+stage1_ranking:
+  # Passing Stage 1 recipes within this mean-recall distance of the best
+  # passing recipe remain eligible for Stage 2 shortlisting. Eligible recipes
+  # are ranked by higher mean Stage 1 F1, then deterministic recipe id.
+  recall_tolerance: 0.05
 
 optimizer:
   # Number of passing Stage 1 recipes expanded into Stage 2.
-  shortlist_top_k: 3
+  shortlist_top_k: 5
 
-  # Recipes within this F1 of the best validation F1 are treated as near-ties.
-  selection_margin: 0.005
+  # Recipes within this F1 of the best mean per-image validation F1 are
+  # considered near-ties; among near-ties SNAPpy prefers the simpler adequate
+  # feature pack, Stage 1 pass-through before SVM when applicable, simpler SVM
+  # settings, then better Stage 1 rank.
+  stage2_f1_tolerance: 0.005
 
   # Safety caps to prevent accidental huge sweeps.
   max_stage1_preflight_configs: 1000
   max_stage2_recipes_after_shortlist: 100
 
-exports:
-  # Same as CLI flag --export-optimize-report.
-  export_optimize_report: false
-
-  # Same as CLI flag --export-candidate-features.
-  export_candidate_features: false
+pipeline_defaults:
+  # Required physical voxel spacing used by real-distance preprocessing,
+  # physical matching, fitting-derived sigma features, and physical feature
+  # measurements.
+  # Set these to the real pixel and z-step spacing for your microscope data.
+  xy_spacing_nm: null
+  z_spacing_nm: null
 
 # Stage 2 model/feature tuning.
-# Expected entries: base_only, curated_balanced, shape_localization, distortion,
-# intensity_quality, model_evidence, full.
+# Expected entries: core_fit, core_contrast, core_morphology, full_interpretable.
 stage2_feature_packs:
-  - base_only
-  - curated_balanced
-  - shape_localization
-  - distortion
-  - intensity_quality
-  - model_evidence
-  - full
-# Local fitting variants swept during Stage 2.
-# Expected: xy_z_gaussian, gaussian_3d, distorted_gaussian_3d.
-stage2_fit_variants:
-  - xy_z_gaussian
+  - core_fit
+  - core_contrast
+  - core_morphology
+  - full_interpretable
+# The fitting mode comes from pipeline_defaults.fit_method or from each
+# explicit recipe's fit_method; Stage 2 does not run a separate fitting-mode
+# sweep by default.
 
 # SVM hyperparameter sweep.
 svm_sweep:
   kernels: [linear, rbf, polynomial]
-  box_constraints: [0.01, 0.1, 1.0, 10.0, 100.0]
-  # RBF/poly gamma values. auto lets scikit-learn choose 1 / n_features.
-  kernel_scales: [auto, 1.0]
+  box_constraints: [0.1, 1.0, 10.0]
+  # RBF/poly gamma values. auto uses 1 / n_features; scale uses
+  # 1 / (n_features * feature variance).
+  kernel_scales: [auto, scale, 0.1, 1.0, 10.0]
   polynomial_orders: [2, 3]
   standardize: true
-  # balanced weights positives/negatives inversely to class frequency; none disables weighting.
-  class_weight_mode: balanced
-  # null means no manually supplied class-weight dictionary.
-  class_weights: null
+  # on uses scikit-learn balanced class weights; off disables class weighting.
+  class_weighting: "on"
+
+# During Stage 2, SNAPpy chooses one global SVM decision threshold on val/.
+# It tests 0.0, min(score)-1e-6, and score quantiles:
+# 1%, 5%, 10%, 15%, 20%, ..., 95%, 99%.
+# Thresholds are selected by highest mean per-image F1, with ties going to the
+# threshold closest to 0.0.
 
 # In-memory cache sizes. These affect runtime only; they do not change the model.
 runtime_cache:
-  # Stores processed/smoothed 3D volumes shared across Stage 1 recipes.
-  # 96 covers the default 4-image Stage 1 screen plus most 100% development Stage 2 sweeps.
-  preprocess_cache_entries: 96
+  # Stores image volumes shared across Stage 1 recipes:
+  # one cache for background-corrected/normalized feature volumes and one cache
+  # for detector-smoothed Stage 1 volumes.
+  image_volume_cache_entries: 96
   # Stores Stage 1 candidate coordinates/scores only, not full image volumes.
+  # During optimization SNAPpy prunes this cache to the current Stage 1 leaderboard.
   stage1_cache_enabled: true
   stage1_cache_entries: 128
   # Stores fitted candidate feature tables reused across feature-pack/SVM sweeps.
+  # During optimization SNAPpy caches only the union of features used by the
+  # configured Stage 2 feature packs.
   fit_cache_enabled: true
   fit_cache_entries: 512

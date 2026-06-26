@@ -3,14 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import linear_sum_assignment
+from scipy.spatial import cKDTree
 
 from .detection import detect_candidates
 from .features import feature_table
@@ -20,6 +19,29 @@ from .model import AcceptAllCandidatesModel, TrainedModel, fit_svm_pipeline, ite
 from .preprocess import apply_preprocessing, apply_processing_base, apply_smoothing
 
 
+SVM_THRESHOLD_QUANTILES: tuple[float, ...] = (
+    0.01,
+    0.05,
+    0.10,
+    0.15,
+    0.20,
+    0.25,
+    0.30,
+    0.35,
+    0.40,
+    0.45,
+    0.50,
+    0.55,
+    0.60,
+    0.65,
+    0.70,
+    0.75,
+    0.80,
+    0.85,
+    0.90,
+    0.95,
+    0.99,
+)
 _STAGE1_CACHE: "OrderedDict[str, tuple[np.ndarray, np.ndarray]]" = OrderedDict()
 _STAGE1_CACHE_CONFIG: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 _DEFAULT_STAGE1_CACHE_ENTRIES = 128
@@ -27,25 +49,21 @@ _PROCESSING_BASE_CACHE: "OrderedDict[str, np.ndarray]" = OrderedDict()
 _PROCESSING_BASE_CACHE_CONFIG: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 _PREPROCESS_CACHE: "OrderedDict[str, np.ndarray]" = OrderedDict()
 _PREPROCESS_CACHE_CONFIG: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
-_DEFAULT_PREPROCESS_CACHE_ENTRIES = 96
+_DEFAULT_IMAGE_VOLUME_CACHE_ENTRIES = 96
 _FIT_CACHE: "OrderedDict[str, tuple[np.ndarray, np.ndarray, pd.DataFrame]]" = OrderedDict()
 _FIT_CACHE_CONFIG: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 _DEFAULT_FIT_CACHE_ENTRIES = 512
 _LABEL_CACHE: "OrderedDict[str, np.ndarray]" = OrderedDict()
 _DEFAULT_LABEL_CACHE_ENTRIES = 4096
 _PROCESSING_BASE_KEY_FIELDS = (
-    "xy_spacing",
-    "z_spacing",
+    "xy_spacing_nm",
+    "z_spacing_nm",
     "norm_enabled",
     "norm_method",
-    "norm_param1",
-    "norm_param2",
-    "norm_param3",
     "background_enabled",
     "background_method",
-    "background_mode",
-    "background_scale",
     "background_param",
+    "background_param_nm",
     "background_clip",
 )
 _PREPROCESS_KEY_FIELDS = (
@@ -53,16 +71,18 @@ _PREPROCESS_KEY_FIELDS = (
     "preproc_enabled",
     "preproc_method",
     "preproc_sigma",
+    "preproc_sigma_nm",
 )
 _STAGE1_KEY_FIELDS = (
     *_PREPROCESS_KEY_FIELDS,
     "maxima_method",
     "maxima_neighborhood",
+    "maxima_min_distance_nm",
     "sigma_value",
+    "sigma_nm",
     "threshold_value",
     "h_max_sigma_multiplier",
     "h_max_sigma_mode",
-    "log_scale_normalize",
     "max_candidates",
 )
 _FIT_KEY_FIELDS = (
@@ -80,12 +100,11 @@ _FIT_KEY_FIELDS = (
     "full_fit_unlabeled_candidates_per_expected_label",
     "fit_method",
     "fit_window",
-    "fit_background_method",
     "fit_background_width",
-    "fit_poly_degree",
     "fit_max_iterations",
     "fit_tolerance",
     "fit_fallback_method",
+    "feature_cache_features",
 )
 
 
@@ -95,10 +114,28 @@ def ensure_dir(path: str | Path) -> Path:
     return path
 
 
-def pairwise_distances(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+def _match_spacing_array(match_spacing_nm: tuple[float, ...] | None, ndim: int) -> np.ndarray | None:
+    if match_spacing_nm is None:
+        return None
+    spacing = np.asarray(match_spacing_nm, dtype=np.float32)
+    if spacing.shape != (ndim,):
+        raise ValueError(f"match_spacing_nm must have {ndim} entries for {ndim}D coordinates.")
+    if not np.all(np.isfinite(spacing)) or np.any(spacing <= 0):
+        raise ValueError("match_spacing_nm must contain positive finite values.")
+    return spacing
+
+
+def pairwise_distances(
+    a: np.ndarray,
+    b: np.ndarray,
+    match_spacing_nm: tuple[float, ...] | None = None,
+) -> np.ndarray:
     if len(a) == 0 or len(b) == 0:
         return np.empty((len(a), len(b)), dtype=np.float32)
     diff = a[:, None, :] - b[None, :, :]
+    spacing = _match_spacing_array(match_spacing_nm, diff.shape[2])
+    if spacing is not None:
+        diff = diff * spacing
     return np.sqrt(np.sum(diff * diff, axis=2)).astype(np.float32)
 
 
@@ -111,33 +148,66 @@ def _candidate_bounds(center: np.ndarray, shape: tuple[int, ...], radius: int) -
     return tuple(bounds)
 
 
-def match_points(pred: np.ndarray, gt: np.ndarray, distance: float) -> tuple[int, int, int]:
+def _greedy_match_assignment(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    distance: float,
+    match_spacing_nm: tuple[float, ...] | None = None,
+) -> dict[int, int]:
+    """One-to-one nearest-neighbor assignment within the configured radius."""
     if len(pred) == 0:
-        return 0, 0, int(len(gt))
+        return {}
     if len(gt) == 0:
-        return 0, int(len(pred)), 0
-    d = pairwise_distances(pred, gt)
-    cost = np.where(d <= distance, d, distance + 1e6)
-    row_ind, col_ind = linear_sum_assignment(cost)
-    matched = sum(float(d[r, c]) <= distance for r, c in zip(row_ind, col_ind))
-    tp = int(matched)
+        return {}
+    pred_arr = np.asarray(pred, dtype=np.float32)
+    gt_arr = np.asarray(gt, dtype=np.float32)
+    spacing = _match_spacing_array(match_spacing_nm, pred_arr.shape[1])
+    if spacing is not None:
+        pred_arr = pred_arr * spacing
+        gt_arr = gt_arr * spacing
+    radius = float(distance)
+    tree = cKDTree(gt_arr.astype(np.float64, copy=False))
+    candidate_gt_pairs: list[tuple[float, int, int]] = []
+    for pred_id, point in enumerate(pred_arr):
+        for gt_id in tree.query_ball_point(point.astype(np.float64, copy=False), r=radius + 1e-6):
+            delta = point - gt_arr[int(gt_id)]
+            dist = float(np.sqrt(np.sum(delta * delta)))
+            if dist <= radius:
+                candidate_gt_pairs.append((dist, int(pred_id), int(gt_id)))
+    candidate_gt_pairs = sorted(
+        candidate_gt_pairs,
+        key=lambda item: (item[0], item[1], item[2]),
+    )
+    assignment: dict[int, int] = {}
+    used_gt: set[int] = set()
+    for _, pred_id, gt_id in candidate_gt_pairs:
+        if pred_id in assignment or gt_id in used_gt:
+            continue
+        assignment[pred_id] = gt_id
+        used_gt.add(gt_id)
+    return assignment
+
+
+def match_points(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    distance: float,
+    match_spacing_nm: tuple[float, ...] | None = None,
+) -> tuple[int, int, int]:
+    assignment = _greedy_match_assignment(pred, gt, distance, match_spacing_nm=match_spacing_nm)
+    tp = int(len(assignment))
     fp = int(len(pred) - tp)
     fn = int(len(gt) - tp)
     return tp, fp, fn
 
 
-def match_points_with_assignment(pred: np.ndarray, gt: np.ndarray, distance: float) -> tuple[int, int, int, dict[int, int]]:
-    if len(pred) == 0:
-        return 0, 0, int(len(gt)), {}
-    if len(gt) == 0:
-        return 0, int(len(pred)), 0, {}
-    d = pairwise_distances(pred, gt)
-    cost = np.where(d <= distance, d, distance + 1e6)
-    row_ind, col_ind = linear_sum_assignment(cost)
-    assignment: dict[int, int] = {}
-    for row, col in zip(row_ind, col_ind):
-        if float(d[row, col]) <= distance:
-            assignment[int(row)] = int(col)
+def match_points_with_assignment(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    distance: float,
+    match_spacing_nm: tuple[float, ...] | None = None,
+) -> tuple[int, int, int, dict[int, int]]:
+    assignment = _greedy_match_assignment(pred, gt, distance, match_spacing_nm=match_spacing_nm)
     tp = int(len(assignment))
     fp = int(len(pred) - tp)
     fn = int(len(gt) - tp)
@@ -171,6 +241,12 @@ def _processing_base_signature(pipeline_cfg: dict[str, Any]) -> str:
 
 def _fit_signature(pipeline_cfg: dict[str, Any], label_count: int | None) -> str:
     payload = {key: pipeline_cfg.get(key) for key in _FIT_KEY_FIELDS}
+    if pipeline_cfg.get("feature_cache_features") is None:
+        payload["feature_cache_features"] = (
+            list(pipeline_cfg.get("selected_features") or [])
+            if "selected_features" in pipeline_cfg
+            else "__all__"
+        )
     payload["label_count"] = label_count
     encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha1(encoded).hexdigest()
@@ -180,8 +256,8 @@ def _stage1_cache_limit(pipeline_cfg: dict[str, Any]) -> int:
     return max(int(pipeline_cfg.get("stage1_cache_entries", _DEFAULT_STAGE1_CACHE_ENTRIES)), 0)
 
 
-def _preprocess_cache_limit(pipeline_cfg: dict[str, Any]) -> int:
-    return max(int(pipeline_cfg.get("preprocess_cache_entries", _DEFAULT_PREPROCESS_CACHE_ENTRIES)), 0)
+def _image_volume_cache_limit(pipeline_cfg: dict[str, Any]) -> int:
+    return max(int(pipeline_cfg.get("image_volume_cache_entries", _DEFAULT_IMAGE_VOLUME_CACHE_ENTRIES)), 0)
 
 
 def _fit_cache_limit(pipeline_cfg: dict[str, Any]) -> int:
@@ -199,6 +275,11 @@ def clear_pipeline_caches() -> None:
     _FIT_CACHE.clear()
     _FIT_CACHE_CONFIG.clear()
     _LABEL_CACHE.clear()
+
+
+def stage1_cache_signature(pipeline_cfg: dict[str, Any]) -> str:
+    """Return the candidate-cache signature for a Stage 1 recipe."""
+    return _stage1_signature(pipeline_cfg)
 
 
 def _label_cache_key(path: str | Path) -> str:
@@ -221,10 +302,91 @@ def _image_cache_key(path: str | Path) -> str:
     return f"{resolved}::{marker}"
 
 
+def _stage1_cache_key(image_path: str | Path, pipeline_cfg: dict[str, Any]) -> tuple[str, str, str]:
+    image_key = _image_cache_key(image_path)
+    signature = _stage1_signature(pipeline_cfg)
+    return f"{image_key}::{signature}", image_key, signature
+
+
+def _processing_base_cache_key(image_path: str | Path, pipeline_cfg: dict[str, Any]) -> tuple[str, str]:
+    signature = _processing_base_signature(pipeline_cfg)
+    return f"{_image_cache_key(image_path)}::{signature}", signature
+
+
+def _preprocess_cache_key(image_path: str | Path, pipeline_cfg: dict[str, Any]) -> tuple[str, str]:
+    signature = _preprocess_signature(pipeline_cfg)
+    return f"{_image_cache_key(image_path)}::{signature}", signature
+
+
+def prune_stage1_candidate_cache(
+    *,
+    allowed_signatures: set[str],
+    image_paths: list[str | Path] | tuple[str | Path, ...] | None = None,
+) -> int:
+    """Keep only Stage 1 candidate-cache entries useful for the current optimizer leaderboard."""
+    allowed_image_paths = None
+    if image_paths is not None:
+        allowed_image_paths = {str(Path(path).resolve()) for path in image_paths}
+    removed = 0
+    for key in list(_STAGE1_CACHE):
+        meta = _STAGE1_CACHE_CONFIG.get(key, {})
+        keep_signature = str(meta.get("signature", "")) in allowed_signatures
+        keep_image = allowed_image_paths is None or str(meta.get("image_path", "")) in allowed_image_paths
+        if keep_signature and keep_image:
+            continue
+        _STAGE1_CACHE.pop(key, None)
+        _STAGE1_CACHE_CONFIG.pop(key, None)
+        removed += 1
+    return removed
+
+
+def promote_stage1_candidate_cache(
+    *,
+    source_recipe: dict[str, Any],
+    target_recipe: dict[str, Any],
+    image_paths: list[str | Path] | tuple[str | Path, ...],
+) -> int:
+    """Alias preflight Stage 1 candidate caches to the Stage 2 recipe key."""
+    promoted = 0
+    for image_path in image_paths:
+        source_key, _, source_signature = _stage1_cache_key(image_path, source_recipe)
+        cached = _STAGE1_CACHE.get(source_key)
+        if cached is None:
+            continue
+        target_key, _, target_signature = _stage1_cache_key(image_path, target_recipe)
+        _STAGE1_CACHE[target_key] = cached
+        _STAGE1_CACHE.move_to_end(target_key)
+        _STAGE1_CACHE_CONFIG[target_key] = {
+            "image_path": str(Path(image_path).resolve()),
+            "signature": target_signature,
+            "promoted_from_signature": source_signature,
+        }
+        promoted += 1
+    return promoted
+
+
+def promote_stage1_image_volume_cache(
+    *,
+    recipe: dict[str, Any],
+    image_paths: list[str | Path] | tuple[str | Path, ...],
+) -> int:
+    """Move useful Stage 1 image-volume cache entries to the recent end of their LRU caches."""
+    promoted = 0
+    for image_path in image_paths:
+        base_key, _ = _processing_base_cache_key(image_path, recipe)
+        if base_key in _PROCESSING_BASE_CACHE:
+            _PROCESSING_BASE_CACHE.move_to_end(base_key)
+            promoted += 1
+        preprocess_key, _ = _preprocess_cache_key(image_path, recipe)
+        if preprocess_key in _PREPROCESS_CACHE:
+            _PREPROCESS_CACHE.move_to_end(preprocess_key)
+            promoted += 1
+    return promoted
+
+
 def _load_processing_base(image_path: str | Path, pipeline_cfg: dict[str, Any]) -> np.ndarray:
     image_path = Path(image_path).resolve()
-    signature = _processing_base_signature(pipeline_cfg)
-    cache_key = f"{_image_cache_key(image_path)}::{signature}"
+    cache_key, signature = _processing_base_cache_key(image_path, pipeline_cfg)
     cached = _PROCESSING_BASE_CACHE.get(cache_key)
     if cached is not None:
         _PROCESSING_BASE_CACHE.move_to_end(cache_key)
@@ -233,7 +395,7 @@ def _load_processing_base(image_path: str | Path, pipeline_cfg: dict[str, Any]) 
     payload = np.asarray(apply_processing_base(read_volume(image_path), pipeline_cfg), dtype=np.float32)
     _PROCESSING_BASE_CACHE[cache_key] = payload
     _PROCESSING_BASE_CACHE_CONFIG[cache_key] = {"image_path": str(image_path), "signature": signature}
-    limit = _preprocess_cache_limit(pipeline_cfg)
+    limit = _image_volume_cache_limit(pipeline_cfg)
     while limit >= 0 and len(_PROCESSING_BASE_CACHE) > limit:
         oldest_key, _ = _PROCESSING_BASE_CACHE.popitem(last=False)
         _PROCESSING_BASE_CACHE_CONFIG.pop(oldest_key, None)
@@ -245,8 +407,7 @@ def _load_processed_image(image_path: str | Path, pipeline_cfg: dict[str, Any]) 
     if not pipeline_cfg.get("stage1_cache_enabled", True):
         return apply_preprocessing(read_volume(image_path), pipeline_cfg)
 
-    signature = _preprocess_signature(pipeline_cfg)
-    cache_key = f"{_image_cache_key(image_path)}::{signature}"
+    cache_key, signature = _preprocess_cache_key(image_path, pipeline_cfg)
     cached = _PREPROCESS_CACHE.get(cache_key)
     if cached is not None:
         _PREPROCESS_CACHE.move_to_end(cache_key)
@@ -256,7 +417,7 @@ def _load_processed_image(image_path: str | Path, pipeline_cfg: dict[str, Any]) 
     payload = np.asarray(apply_smoothing(base, pipeline_cfg), dtype=np.float32)
     _PREPROCESS_CACHE[cache_key] = payload
     _PREPROCESS_CACHE_CONFIG[cache_key] = {"image_path": str(image_path), "signature": signature}
-    limit = _preprocess_cache_limit(pipeline_cfg)
+    limit = _image_volume_cache_limit(pipeline_cfg)
     while limit >= 0 and len(_PREPROCESS_CACHE) > limit:
         oldest_key, _ = _PREPROCESS_CACHE.popitem(last=False)
         _PREPROCESS_CACHE_CONFIG.pop(oldest_key, None)
@@ -276,41 +437,59 @@ def _read_points_cached(path: str | Path) -> np.ndarray:
     return points.copy()
 
 
-def _load_stage1(image_path: str | Path, pipeline_cfg: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    image_path = Path(image_path).resolve()
-    if not pipeline_cfg.get("stage1_cache_enabled", True):
-        volume = _load_processed_image(image_path, pipeline_cfg)
-        det = detect_candidates(volume, pipeline_cfg)
-        return volume, np.asarray(det.coords, dtype=np.float32), np.asarray(det.scores, dtype=np.float32)
-
-    signature = _stage1_signature(pipeline_cfg)
-    cache_key = f"{_image_cache_key(image_path)}::{signature}"
-    cached = _STAGE1_CACHE.get(cache_key)
-    if cached is not None:
-        _STAGE1_CACHE.move_to_end(cache_key)
-        volume = _load_processed_image(image_path, pipeline_cfg)
-        return volume, cached[0].copy(), cached[1].copy()
-
-    volume = _load_processed_image(image_path, pipeline_cfg)
-    det = detect_candidates(volume, pipeline_cfg)
-    payload = (np.asarray(det.coords, dtype=np.float32), np.asarray(det.scores, dtype=np.float32))
+def _store_stage1_cache(
+    image_path: str | Path,
+    cache_key: str,
+    signature: str,
+    payload: tuple[np.ndarray, np.ndarray],
+    pipeline_cfg: dict[str, Any],
+) -> None:
     _STAGE1_CACHE[cache_key] = payload
-    _STAGE1_CACHE_CONFIG[cache_key] = {"image_path": str(image_path), "signature": signature}
+    _STAGE1_CACHE_CONFIG[cache_key] = {"image_path": str(Path(image_path).resolve()), "signature": signature}
     limit = _stage1_cache_limit(pipeline_cfg)
     while limit >= 0 and len(_STAGE1_CACHE) > limit:
         oldest_key, _ = _STAGE1_CACHE.popitem(last=False)
         _STAGE1_CACHE_CONFIG.pop(oldest_key, None)
-    return volume, payload[0].copy(), payload[1].copy()
+
+
+def _load_stage1_candidates(image_path: str | Path, pipeline_cfg: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    image_path = Path(image_path).resolve()
+    if not pipeline_cfg.get("stage1_cache_enabled", True):
+        volume = _load_processed_image(image_path, pipeline_cfg)
+        det = detect_candidates(volume, pipeline_cfg)
+        return np.asarray(det.coords, dtype=np.float32), np.asarray(det.scores, dtype=np.float32)
+
+    cache_key, _, signature = _stage1_cache_key(image_path, pipeline_cfg)
+    cached = _STAGE1_CACHE.get(cache_key)
+    if cached is not None:
+        _STAGE1_CACHE.move_to_end(cache_key)
+        return cached[0].copy(), cached[1].copy()
+
+    volume = _load_processed_image(image_path, pipeline_cfg)
+    det = detect_candidates(volume, pipeline_cfg)
+    payload = (np.asarray(det.coords, dtype=np.float32), np.asarray(det.scores, dtype=np.float32))
+    _store_stage1_cache(image_path, cache_key, signature, payload, pipeline_cfg)
+    return payload[0].copy(), payload[1].copy()
+
+
+def _load_stage1(image_path: str | Path, pipeline_cfg: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    volume = _load_processed_image(image_path, pipeline_cfg)
+    coords, scores = _load_stage1_candidates(image_path, pipeline_cfg)
+    return volume, coords, scores
 
 
 def _select_cached_features(features: pd.DataFrame, selected_features: list[str] | None) -> pd.DataFrame:
-    if not selected_features:
+    if selected_features is None:
         return features.copy(deep=True)
-    out = features.copy(deep=True)
-    missing = [col for col in selected_features if col not in out.columns]
-    for col in missing:
-        out[col] = 0.0
-    return out[selected_features].copy()
+    if not selected_features:
+        return pd.DataFrame(index=features.index)
+    missing = [col for col in selected_features if col not in features.columns]
+    if missing:
+        raise ValueError(
+            "Selected SNAPpy feature(s) are unavailable in the fitted candidate table: "
+            f"{', '.join(missing)}. Use a compatible feature pack or update selected_features."
+        )
+    return features[selected_features].copy()
 
 
 def _copy_fit_payload(
@@ -321,10 +500,16 @@ def _copy_fit_payload(
     return coords.copy(), scores.copy(), _select_cached_features(features, selected_features)
 
 
-def preflight_image(image_path: str | Path, label_path: str | Path, recipe: dict[str, Any], match_distance: float) -> dict[str, Any]:
-    _, coords, _ = _load_stage1(image_path, recipe)
+def preflight_image(
+    image_path: str | Path,
+    label_path: str | Path,
+    recipe: dict[str, Any],
+    match_distance: float,
+    match_spacing_nm: tuple[float, ...] | None = None,
+) -> dict[str, Any]:
+    coords, _ = _load_stage1_candidates(image_path, recipe)
     gt = _read_points_cached(label_path)
-    tp, fp, fn = match_points(coords, gt, match_distance)
+    tp, fp, fn = match_points(coords, gt, match_distance, match_spacing_nm=match_spacing_nm)
     metrics = precision_recall_f1(tp, fp, fn)
     return {
         "n_candidates": int(len(coords)),
@@ -409,14 +594,22 @@ def _greedy_nms(coords: np.ndarray, ranking: np.ndarray, min_distance: float) ->
         return np.arange(len(coords), dtype=np.int32)
     keep: list[int] = []
     min_distance_sq = float(min_distance) ** 2
+    coords_arr = np.asarray(coords, dtype=np.float32)
+    tree = cKDTree(coords_arr.astype(np.float64, copy=False))
+    available = np.ones(len(coords_arr), dtype=bool)
     order = np.argsort(ranking)[::-1]
     for idx in order:
-        if not keep:
-            keep.append(int(idx))
+        idx = int(idx)
+        if not available[idx]:
             continue
-        delta = coords[np.asarray(keep, dtype=np.int32)] - coords[int(idx)]
-        if np.all(np.sum(delta * delta, axis=1) > min_distance_sq):
-            keep.append(int(idx))
+        keep.append(idx)
+        for neighbor in tree.query_ball_point(coords_arr[idx].astype(np.float64, copy=False), r=float(min_distance) + 1e-6):
+            neighbor = int(neighbor)
+            if neighbor == idx:
+                continue
+            delta = coords_arr[neighbor] - coords_arr[idx]
+            if float(np.sum(delta * delta)) <= min_distance_sq:
+                available[neighbor] = False
     return np.asarray(keep, dtype=np.int32)
 
 
@@ -450,7 +643,13 @@ def _prune_candidates_for_fit(
 def detect_image(image_path: str | Path, pipeline_cfg: dict[str, Any], label_count: int | None = None) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     image_path = Path(image_path).resolve()
     image_key = _image_cache_key(image_path)
-    selected_features = list(pipeline_cfg.get("selected_features") or [])
+    selected_features = list(pipeline_cfg.get("selected_features") or []) if "selected_features" in pipeline_cfg else None
+    if pipeline_cfg.get("feature_cache_features") is not None:
+        feature_cache_features = list(pipeline_cfg.get("feature_cache_features") or [])
+    elif selected_features is not None:
+        feature_cache_features = list(selected_features)
+    else:
+        feature_cache_features = None
     if bool(pipeline_cfg.get("fit_cache_enabled", True)):
         signature = _fit_signature(pipeline_cfg, label_count)
         cache_key = f"{image_key}::{signature}"
@@ -459,15 +658,16 @@ def detect_image(image_path: str | Path, pipeline_cfg: dict[str, Any], label_cou
             _FIT_CACHE.move_to_end(cache_key)
             return _copy_fit_payload(cached, selected_features)
 
-    volume, coords, scores = _load_stage1(image_path, pipeline_cfg)
-    coords, scores = _prune_candidates_for_fit(volume, coords, scores, pipeline_cfg, label_count=label_count)
+    coords, scores = _load_stage1_candidates(image_path, pipeline_cfg)
+    feature_volume = _load_processing_base(image_path, pipeline_cfg)
+    coords, scores = _prune_candidates_for_fit(feature_volume, coords, scores, pipeline_cfg, label_count=label_count)
     full_fit_limit = _full_fit_limit_for_candidates(pipeline_cfg, label_count=label_count)
     fit_window = int(pipeline_cfg.get("fit_window", 7) or 7)
     if fit_window <= 0 or fit_window % 2 == 0:
         raise ValueError("fit_window must be a positive odd integer.")
     window_radius = max(fit_window // 2, 1)
     fit = refine_candidates(
-        volume,
+        feature_volume,
         coords,
         scores,
         window_radius=window_radius,
@@ -475,7 +675,12 @@ def detect_image(image_path: str | Path, pipeline_cfg: dict[str, Any], label_cou
         fit_cfg=pipeline_cfg,
         full_fit_limit=full_fit_limit,
     )
-    all_features = feature_table(fit.table, None)
+    all_features = feature_table(
+        fit.table,
+        feature_cache_features,
+        xy_spacing_nm=pipeline_cfg.get("xy_spacing_nm"),
+        z_spacing_nm=pipeline_cfg.get("z_spacing_nm"),
+    )
     payload = (np.asarray(fit.coords, dtype=np.float32), np.asarray(scores, dtype=np.float32), all_features)
     if bool(pipeline_cfg.get("fit_cache_enabled", True)):
         _FIT_CACHE[cache_key] = payload
@@ -487,28 +692,55 @@ def detect_image(image_path: str | Path, pipeline_cfg: dict[str, Any], label_cou
     return _copy_fit_payload(payload, selected_features)
 
 
-def _label_candidates(coords: np.ndarray, gt: np.ndarray, distance: float) -> np.ndarray:
+def _label_candidates(
+    coords: np.ndarray,
+    gt: np.ndarray,
+    distance: float,
+    match_spacing_nm: tuple[float, ...] | None = None,
+) -> np.ndarray:
     if len(coords) == 0:
         return np.empty((0,), dtype=np.int32)
     labels = np.zeros(len(coords), dtype=np.int32)
-    if len(gt) == 0:
-        return labels
-    d = pairwise_distances(coords, gt)
-    min_d = d.min(axis=1)
-    labels[min_d <= distance] = 1
+    for candidate_id in _greedy_match_assignment(coords, gt, distance, match_spacing_nm=match_spacing_nm):
+        labels[candidate_id] = 1
     return labels
 
 
-def _balance_examples(x: pd.DataFrame, y: np.ndarray, max_ratio: float | None = 8.0) -> tuple[pd.DataFrame, np.ndarray]:
-    if max_ratio is None:
-        return x, y
-    pos = np.flatnonzero(y == 1)
-    neg = np.flatnonzero(y == 0)
-    if len(pos) == 0 or len(neg) == 0:
-        return x, y
-    keep_neg = min(len(neg), int(math.ceil(len(pos) * float(max_ratio))))
-    keep = np.concatenate([pos, neg[:keep_neg]])
-    return x.iloc[keep].reset_index(drop=True), y[keep]
+def summarize_stage1_candidate_labels(
+    dataset_root: str | Path,
+    split: str,
+    recipe: dict[str, Any],
+    match_distance: float,
+    image_limit: int | None = None,
+    match_spacing_nm: tuple[float, ...] | None = None,
+) -> dict[str, Any]:
+    pairs = split_pairs(dataset_root, split)
+    if image_limit is not None:
+        pairs = pairs[: int(image_limit)]
+    n_candidates = 0
+    n_positive = 0
+    n_negative = 0
+    n_gt = 0
+    for image_path, label_path in pairs:
+        gt = _read_points_cached(label_path)
+        coords, _ = _load_stage1_candidates(image_path, recipe)
+        labels = _label_candidates(coords, gt, match_distance, match_spacing_nm=match_spacing_nm)
+        positives = int(np.sum(labels == 1))
+        n_candidates += int(len(coords))
+        n_positive += positives
+        n_negative += int(len(coords) - positives)
+        n_gt += int(len(gt))
+    return {
+        "split": split,
+        "n_images": int(len(pairs)),
+        "n_ground_truth": int(n_gt),
+        "n_candidates": int(n_candidates),
+        "n_positive_candidates": int(n_positive),
+        "n_negative_candidates": int(n_negative),
+        "all_positive_candidates": bool(n_candidates > 0 and n_negative == 0),
+        "no_training_candidates": bool(n_candidates == 0),
+        "no_true_positive_candidates": bool(n_candidates > 0 and n_positive == 0),
+    }
 
 
 def build_training_matrices(
@@ -517,6 +749,7 @@ def build_training_matrices(
     recipe: dict[str, Any],
     match_distance: float,
     image_limit: int | None = None,
+    match_spacing_nm: tuple[float, ...] | None = None,
 ) -> tuple[pd.DataFrame, np.ndarray, list[dict[str, Any]]]:
     rows: list[pd.DataFrame] = []
     labels: list[np.ndarray] = []
@@ -527,7 +760,7 @@ def build_training_matrices(
     for image_path, label_path in pairs:
         gt = _read_points_cached(label_path)
         coords, scores, feats = detect_image(image_path, recipe, label_count=int(len(gt)))
-        y = _label_candidates(coords, gt, match_distance)
+        y = _label_candidates(coords, gt, match_distance, match_spacing_nm=match_spacing_nm)
         feats = feats.copy()
         selected = recipe.get("selected_features")
         if "score_raw" not in feats.columns and (selected is None or "score_raw" in selected):
@@ -549,8 +782,6 @@ def build_training_matrices(
         raise RuntimeError(f"No labeled image pairs found for split '{split}' under {dataset_root}")
     x = pd.concat(rows, ignore_index=True)
     y = np.concatenate(labels).astype(np.int32)
-    ratio = recipe.get("negative_to_positive_ratio")
-    x, y = _balance_examples(x, y, None if ratio is None else float(ratio))
     return x, y, metas
 
 
@@ -587,26 +818,27 @@ def tune_score_threshold(
     scores: dict[str, np.ndarray],
     gts: dict[str, np.ndarray],
     match_distance: float,
+    match_spacing_nm: tuple[float, ...] | None = None,
 ) -> tuple[float, dict[str, float]]:
     all_scores: list[float] = []
     for arr in scores.values():
         if len(arr):
             all_scores.extend(float(x) for x in arr)
     if not all_scores:
-        metrics = evaluate_predictions(preds, gts, match_distance)
+        metrics = evaluate_predictions_for_selection(preds, gts, match_distance, match_spacing_nm=match_spacing_nm)
         return 0.0, metrics
-    quantiles = pd.Series(all_scores).quantile([0.01, 0.05, 0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 0.95, 0.99]).tolist()
-    candidates = sorted(set([min(all_scores) - 1e-6, 0.0, *[float(q) for q in quantiles]]))
+    score_values = np.asarray(all_scores, dtype=np.float32)
+    quantiles = np.quantile(score_values, SVM_THRESHOLD_QUANTILES).tolist()
+    candidates = sorted(set([float(np.min(score_values)) - 1e-6, 0.0, *[float(q) for q in quantiles]]))
     best_threshold = 0.0
     best_metrics: dict[str, float] | None = None
-    best_key = (-1.0, -1.0, -1.0, -1.0)
+    best_key = (-1.0, float("-inf"))
     for threshold in candidates:
         filtered = apply_score_threshold(preds, scores, threshold)
-        metrics = evaluate_predictions(filtered, gts, match_distance)
+        metrics = evaluate_predictions_for_selection(filtered, gts, match_distance, match_spacing_nm=match_spacing_nm)
         key = (
-            float(metrics["f1"]),
-            float(metrics["precision"]),
-            float(metrics["recall"]),
+            float(metrics["f1_mean_image"]),
+            -abs(float(threshold)),
         )
         if key > best_key:
             best_key = key
@@ -620,13 +852,15 @@ def _svm_complexity_key(params: dict[str, Any]) -> tuple[float, float, float, fl
     kernel = str(params.get("kernel", "linear")).lower()
     kernel_rank = {"linear": 0.0, "rbf": 1.0, "polynomial": 2.0, "poly": 2.0}.get(kernel, 3.0)
     c_value = float(params.get("C", 1.0))
-    c_rank = math.log10(max(c_value, 1e-12))
+    c_rank = abs(math.log10(max(c_value, 1e-12)))
     degree = float(params.get("degree", 2)) if kernel in {"polynomial", "poly"} else 0.0
     gamma = params.get("gamma")
-    if gamma in (None, "auto", "scale"):
+    if gamma is None or str(gamma).strip().lower() == "auto":
         gamma_rank = 0.0
+    elif str(gamma).strip().lower() == "scale":
+        gamma_rank = 1.0
     else:
-        gamma_rank = float(gamma)
+        gamma_rank = 2.0 + abs(math.log10(max(float(gamma), 1e-12)))
     return (kernel_rank, c_rank, degree, gamma_rank)
 
 
@@ -638,9 +872,61 @@ def train_native_model(
     match_distance: float,
     train_limit: int | None = None,
     val_limit: int | None = None,
+    match_spacing_nm: tuple[float, ...] | None = None,
 ) -> TrainedModel:
-    x_train, y_train, _ = build_training_matrices(dataset_root, "train", recipe, match_distance, train_limit)
-    _, _, val_metas = build_training_matrices(dataset_root, "val", recipe, match_distance, val_limit)
+    if str(recipe.get("model_type", "")).strip().lower() == "stage1_pass_through":
+        if match_spacing_nm is None:
+            _, _, val_metas = build_training_matrices(dataset_root, "val", recipe, match_distance, val_limit)
+        else:
+            _, _, val_metas = build_training_matrices(
+                dataset_root,
+                "val",
+                recipe,
+                match_distance,
+                val_limit,
+                match_spacing_nm=match_spacing_nm,
+            )
+        pass_through_model = AcceptAllCandidatesModel()
+        selected_features: list[str] = []
+        val_preds_raw, _, val_gts = _predict_metas_scored(val_metas, pass_through_model, selected_features)
+        val_metrics = evaluate_predictions_for_selection(val_preds_raw, val_gts, match_distance, match_spacing_nm=match_spacing_nm)
+        best_params = {
+            "model_type": "stage1_pass_through",
+            "decision_rule": "accept_all_stage1_candidates",
+            "stage1_train_label_status": recipe.get("stage1_train_label_status", "all_positive_stage1"),
+            **{f"val_{metric_name}": float(metric_value) for metric_name, metric_value in val_metrics.items()},
+        }
+        trained = TrainedModel(
+            model=pass_through_model,
+            selected_features=selected_features,
+            best_params=best_params,
+            decision_threshold=0.0,
+            recipe=dict(recipe),
+            validation_metas=val_metas,
+        )
+        save_model(model_path, trained)
+        return trained
+
+    if match_spacing_nm is None:
+        x_train, y_train, _ = build_training_matrices(dataset_root, "train", recipe, match_distance, train_limit)
+        _, _, val_metas = build_training_matrices(dataset_root, "val", recipe, match_distance, val_limit)
+    else:
+        x_train, y_train, _ = build_training_matrices(
+            dataset_root,
+            "train",
+            recipe,
+            match_distance,
+            train_limit,
+            match_spacing_nm=match_spacing_nm,
+        )
+        _, _, val_metas = build_training_matrices(
+            dataset_root,
+            "val",
+            recipe,
+            match_distance,
+            val_limit,
+            match_spacing_nm=match_spacing_nm,
+        )
     if len(y_train) == 0 or x_train.empty:
         recipe_id = recipe.get("recipe_id", "<unknown>")
         raise ValueError(
@@ -660,7 +946,7 @@ def train_native_model(
             )
         pass_through_model = AcceptAllCandidatesModel()
         val_preds_raw, val_scores, val_gts = _predict_metas_scored(val_metas, pass_through_model, selected_features)
-        val_metrics = evaluate_predictions(val_preds_raw, val_gts, match_distance)
+        val_metrics = evaluate_predictions_for_selection(val_preds_raw, val_gts, match_distance, match_spacing_nm=match_spacing_nm)
         best_params = {
             "model_type": "stage1_pass_through",
             "one_class_label": only_label,
@@ -681,7 +967,7 @@ def train_native_model(
     best_model: Any | None = None
     best_threshold = 0.0
     best_params: dict[str, Any] = {}
-    best_key = (-1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 0.0)
+    best_key = (-1.0, 0.0, 0.0, 0.0, 0.0)
 
     for params in iter_svm_param_grid(svm_cfg):
         model = fit_svm_pipeline(x_train_np, y_train, params)
@@ -691,11 +977,10 @@ def train_native_model(
             val_scores,
             val_gts,
             match_distance,
+            match_spacing_nm=match_spacing_nm,
         )
         key = (
-            float(val_metrics["f1"]),
-            float(val_metrics["precision"]),
-            float(val_metrics["recall"]),
+            float(val_metrics["f1_mean_image"]),
             -_svm_complexity_key(params)[0],
             -_svm_complexity_key(params)[1],
             -_svm_complexity_key(params)[2],
@@ -777,13 +1062,12 @@ def predict_split(
     recipe: dict[str, Any] | None,
     model_path: str | Path,
     output_root: str | Path,
-    score_threshold: float = 0.0,
+    score_threshold: float | None = None,
     image_limit: int | None = None,
-) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], float]:
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     output_root = ensure_dir(output_root)
     preds: dict[str, np.ndarray] = {}
     gts: dict[str, np.ndarray] = {}
-    t0 = time.time()
     pairs = split_pairs(dataset_root, split)
     if image_limit is not None:
         pairs = pairs[: int(image_limit)]
@@ -793,7 +1077,7 @@ def predict_split(
         write_points_csv(out_path, coords, scores)
         preds[image_path.stem] = coords
         gts[image_path.stem] = _read_points_cached(label_path)
-    return preds, gts, time.time() - t0
+    return preds, gts
 
 
 def predict_unlabeled_split(
@@ -802,12 +1086,11 @@ def predict_unlabeled_split(
     recipe: dict[str, Any] | None,
     model_path: str | Path,
     output_root: str | Path,
-    score_threshold: float = 0.0,
+    score_threshold: float | None = None,
     image_limit: int | None = None,
-) -> tuple[dict[str, np.ndarray], float]:
+) -> dict[str, np.ndarray]:
     output_root = ensure_dir(output_root)
     preds: dict[str, np.ndarray] = {}
-    t0 = time.time()
     image_paths = split_images(dataset_root, split)
     if image_limit is not None:
         image_paths = image_paths[: int(image_limit)]
@@ -816,40 +1099,7 @@ def predict_unlabeled_split(
         out_path = output_root / f"{image_path.stem}.csv"
         write_points_csv(out_path, coords, scores)
         preds[image_path.stem] = coords
-    return preds, time.time() - t0
-
-
-def predict_unlabeled_split_profiled(
-    dataset_root: str | Path,
-    split: str,
-    recipe: dict[str, Any] | None,
-    model_path: str | Path,
-    output_root: str | Path,
-    score_threshold: float = 0.0,
-    image_limit: int | None = None,
-) -> tuple[dict[str, np.ndarray], float, pd.DataFrame]:
-    output_root = ensure_dir(output_root)
-    preds: dict[str, np.ndarray] = {}
-    rows: list[dict[str, Any]] = []
-    t0 = time.time()
-    image_paths = split_images(dataset_root, split)
-    if image_limit is not None:
-        image_paths = image_paths[: int(image_limit)]
-    for image_path in image_paths:
-        image_start = time.time()
-        coords, scores = predict_image(image_path, recipe, model_path, score_threshold=score_threshold)
-        seconds = float(time.time() - image_start)
-        out_path = output_root / f"{image_path.stem}.csv"
-        write_points_csv(out_path, coords, scores)
-        preds[image_path.stem] = coords
-        rows.append(
-            {
-                "image_id": image_path.stem,
-                "inference_wall_seconds": seconds,
-                "n_predictions": int(len(coords)),
-            }
-        )
-    return preds, time.time() - t0, pd.DataFrame(rows)
+    return preds
 
 
 def predict_split_scored(
@@ -858,11 +1108,10 @@ def predict_split_scored(
     recipe: dict[str, Any] | None,
     model_path: str | Path,
     image_limit: int | None = None,
-) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray], float]:
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray]]:
     preds: dict[str, np.ndarray] = {}
     scores_map: dict[str, np.ndarray] = {}
     gts: dict[str, np.ndarray] = {}
-    t0 = time.time()
     pairs = split_pairs(dataset_root, split)
     if image_limit is not None:
         pairs = pairs[: int(image_limit)]
@@ -871,7 +1120,7 @@ def predict_split_scored(
         preds[image_path.stem] = coords
         scores_map[image_path.stem] = scores
         gts[image_path.stem] = _read_points_cached(label_path)
-    return preds, scores_map, gts, time.time() - t0
+    return preds, scores_map, gts
 
 
 def apply_score_threshold(preds: dict[str, np.ndarray], scores: dict[str, np.ndarray], threshold: float) -> dict[str, np.ndarray]:
@@ -883,12 +1132,17 @@ def apply_score_threshold(preds: dict[str, np.ndarray], scores: dict[str, np.nda
     return out
 
 
-def evaluate_predictions(preds: dict[str, np.ndarray], gts: dict[str, np.ndarray], match_distance: float) -> dict[str, float]:
+def evaluate_predictions(
+    preds: dict[str, np.ndarray],
+    gts: dict[str, np.ndarray],
+    match_distance: float,
+    match_spacing_nm: tuple[float, ...] | None = None,
+) -> dict[str, float]:
     totals = {"tp": 0, "fp": 0, "fn": 0}
     for key in sorted(gts):
         pred = preds.get(key, np.empty((0, 3), dtype=np.float32))
         gt = gts[key]
-        tp, fp, fn = match_points(pred, gt, match_distance)
+        tp, fp, fn = match_points(pred, gt, match_distance, match_spacing_nm=match_spacing_nm)
         totals["tp"] += tp
         totals["fp"] += fp
         totals["fn"] += fn
@@ -903,8 +1157,73 @@ def evaluate_predictions(preds: dict[str, np.ndarray], gts: dict[str, np.ndarray
     }
 
 
+def evaluate_predictions_for_selection(
+    preds: dict[str, np.ndarray],
+    gts: dict[str, np.ndarray],
+    match_distance: float,
+    match_spacing_nm: tuple[float, ...] | None = None,
+) -> dict[str, float]:
+    """Evaluate detections with image-mean metrics as the Stage 2 selection target."""
+    totals = {"tp": 0, "fp": 0, "fn": 0}
+    per_image_metrics: list[dict[str, float]] = []
+    for key in sorted(gts):
+        pred = preds.get(key, np.empty((0, 3), dtype=np.float32))
+        gt = gts[key]
+        tp, fp, fn = match_points(pred, gt, match_distance, match_spacing_nm=match_spacing_nm)
+        totals["tp"] += tp
+        totals["fp"] += fp
+        totals["fn"] += fn
+        metrics = precision_recall_f1(tp, fp, fn)
+        per_image_metrics.append(metrics)
+
+    pooled = precision_recall_f1(totals["tp"], totals["fp"], totals["fn"])
+    n_images = max(len(per_image_metrics), 1)
+    precision_mean_image = float(sum(row["precision"] for row in per_image_metrics) / n_images)
+    recall_mean_image = float(sum(row["recall"] for row in per_image_metrics) / n_images)
+    f1_mean_image = float(sum(row["f1"] for row in per_image_metrics) / n_images)
+    return {
+        "tp": int(totals["tp"]),
+        "fp": int(totals["fp"]),
+        "fn": int(totals["fn"]),
+        "precision": precision_mean_image,
+        "recall": recall_mean_image,
+        "f1": f1_mean_image,
+        "precision_mean_image": precision_mean_image,
+        "recall_mean_image": recall_mean_image,
+        "f1_mean_image": f1_mean_image,
+        "precision_pooled": pooled["precision"],
+        "recall_pooled": pooled["recall"],
+        "f1_pooled": pooled["f1"],
+        "n_images": int(len(per_image_metrics)),
+    }
+
+
 def write_json(path: str | Path, payload: dict[str, Any]) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2))
+    path.write_text(json.dumps(_json_safe(payload), indent=2, allow_nan=False))
     return path
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(val) for val in value]
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if value is pd.NA:
+        return None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        return value
+    if isinstance(missing, (bool, np.bool_)) and bool(missing):
+        return None
+    return value

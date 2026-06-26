@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import shutil
-import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -11,100 +10,265 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .candidate_features import (
-    candidate_feature_columns,
-    candidate_feature_rows,
-    model_type_and_svm_flag,
-    write_candidate_features_csv,
-    write_candidate_features_manifest,
-)
 from .config import ensure_dir, load_config, stage1_recipe_bank, stage2_recipe_bank
 from .pipeline import (
     clear_pipeline_caches,
-    evaluate_predictions,
-    pairwise_distances,
+    evaluate_predictions_for_selection,
     preflight_image,
+    promote_stage1_image_volume_cache,
+    promote_stage1_candidate_cache,
+    prune_stage1_candidate_cache,
     predict_split,
+    precision_recall_f1,
+    stage1_cache_signature,
+    summarize_stage1_candidate_labels,
     train_native_model,
     write_json,
 )
 from .io import read_points_csv, read_volume, split_pairs
 from .model import iter_svm_param_grid
+from .spatial import spacing_zyx_nm
 
 
-_PREFLIGHT_SORT_COLUMNS = [
-    "preflight_utility",
-    "mean_stage1_recall",
-    "mean_stage1_precision",
-    "processing_cost_rank",
+_FINALIST_SORT_COLUMNS = [
+    "feature_pack_simplicity_rank",
+    "model_type_simplicity_rank",
+    "svm_kernel_simplicity_rank",
+    "svm_c_simplicity_rank",
+    "svm_degree_simplicity_rank",
+    "svm_gamma_simplicity_rank",
+    "stage1_rank_passed",
     "recipe_id",
 ]
-_PREFLIGHT_SORT_ASCENDING = [False, False, False, True, True]
-_FINALIST_SORT_COLUMNS = ["val_f1", "preflight_utility", "val_precision", "mean_stage1_precision"]
+_FINALIST_SORT_ASCENDING = [True] * len(_FINALIST_SORT_COLUMNS)
+_FEATURE_PACK_SIMPLICITY_RANK = {
+    "core_fit": 0.0,
+    "core_contrast": 1.0,
+    "core_morphology": 2.0,
+    "full_interpretable": 3.0,
+}
+_MODEL_TYPE_SIMPLICITY_RANK = {
+    "stage1_pass_through": 0.0,
+    "svm": 1.0,
+}
+_KERNEL_SIMPLICITY_RANK = {
+    "linear": 0.0,
+    "rbf": 1.0,
+    "polynomial": 2.0,
+    "poly": 2.0,
+}
+_FITTING_MODE_SIMPLICITY_RANK = {
+    "2d (xy) + 1d (z) gaussian": 0.0,
+    "3d gaussian": 1.0,
+    "distorted 3d gaussian": 2.0,
+}
+_DEFAULT_FITTING_MODE = "2D (XY) + 1D (Z) Gaussian"
 _STAGE1_SCREEN_FIELDS = (
-    "xy_spacing",
-    "z_spacing",
+    "xy_spacing_nm",
+    "z_spacing_nm",
     "preproc_enabled",
     "preproc_method",
     "preproc_sigma",
+    "preproc_sigma_nm",
     "norm_enabled",
     "norm_method",
-    "norm_param1",
-    "norm_param2",
-    "norm_param3",
     "background_enabled",
     "background_method",
-    "background_mode",
-    "background_scale",
     "background_param",
+    "background_param_nm",
     "background_clip",
     "maxima_method",
     "maxima_neighborhood",
+    "maxima_min_distance_nm",
     "sigma_value",
+    "sigma_nm",
     "threshold_value",
     "h_max_sigma_multiplier",
     "h_max_sigma_mode",
-    "log_scale_normalize",
 )
 
 
-def _preflight_utility(mean_recall: float, mean_precision: float, mean_candidates: float, mean_labels: float) -> float:
-    density = max(mean_candidates / max(mean_labels, 1.0), 1.0)
-    return float(mean_recall + 0.05 * mean_precision - 0.08 * math.log1p(density))
+def _match_distance_kwargs(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return matching arguments for voxel or physical-distance matching."""
+    if cfg.get("match_distance_nm") is None:
+        return {"match_distance": float(cfg["match_distance"])}
+    return {
+        "match_distance": float(cfg["match_distance_nm"]),
+        "match_spacing_nm": spacing_zyx_nm(cfg.get("pipeline_defaults", {}), 3),
+    }
 
 
-def _fit_cost_rank(recipe: dict[str, Any]) -> int:
-    fit_method = str(recipe.get("fit_method", "")).strip().lower()
-    if fit_method == "2d (xy) + 1d (z) gaussian":
-        return 0
-    if fit_method == "3d gaussian":
-        return 1
-    if fit_method == "distorted 3d gaussian":
-        return 2
-    return 3
+def _match_distance_summary(cfg: dict[str, Any]) -> dict[str, Any]:
+    if cfg.get("match_distance_nm") is None:
+        return {
+            "match_distance": float(cfg["match_distance"]),
+            "match_distance_units": "voxels",
+            "match_distance_nm": None,
+        }
+    spacing = spacing_zyx_nm(cfg.get("pipeline_defaults", {}), 3)
+    return {
+        "match_distance": float(cfg["match_distance_nm"]),
+        "match_distance_units": "nm",
+        "match_distance_nm": float(cfg["match_distance_nm"]),
+        "match_spacing_zyx_nm": list(spacing),
+    }
 
 
-def _processing_cost_rank(recipe: dict[str, Any]) -> float:
-    """Prefer cheaper Stage 1 processing when preflight quality is otherwise tied."""
-    smoothing_cost = float(recipe.get("preproc_sigma", 0.0) or 0.0) if recipe.get("preproc_enabled", True) else 0.0
-    if not recipe.get("background_enabled", False):
-        return smoothing_cost
+def _stage2_f1_tolerance(cfg: dict[str, Any]) -> float:
+    optimizer_cfg = cfg.get("optimizer", {})
+    value = optimizer_cfg.get("stage2_f1_tolerance", 0.005)
+    if value is None:
+        return 0.005
+    return float(value)
 
-    method = str(recipe.get("background_method", "none")).strip().lower()
-    radius = float(recipe.get("background_param", 0.0) or 0.0)
-    if method in {"rolling_ball_3d", "rolling_ball_3d_exact", "rolling-ball-3d-exact", "rolling ball 3d exact"}:
-        base = 1000.0
-    elif method in {"rolling_ball_2d", "rolling-ball-2d", "rolling ball 2d"}:
-        base = 500.0
-    elif method == "slice_opening_2d":
-        base = 100.0
-    elif method in {"rolling_box_3d", "morph_opening_3d_box"}:
-        base = 10.0
-    elif method == "gaussian":
-        base = 10.0
-    else:
-        base = 50.0
-    return base + radius + 0.01 * smoothing_cost
+
+def _missing_scalar(value: Any) -> bool:
+    return value is None or (isinstance(value, (float, np.floating)) and math.isnan(float(value)))
+
+
+def _stage2_row_recipe(row: pd.Series) -> dict[str, Any]:
+    recipe = row.get("recipe")
+    return recipe if isinstance(recipe, dict) else {}
+
+
+def _stage2_row_model_type(row: pd.Series) -> str:
+    value = row.get("model_type")
+    if _missing_scalar(value):
+        value = _stage2_row_recipe(row).get("model_type")
+    return str(value if not _missing_scalar(value) else "svm").strip().lower()
+
+
+def _is_stage1_pass_through_row(row: pd.Series) -> bool:
+    return _stage2_row_model_type(row) == "stage1_pass_through"
+
+
+def _stage2_row_feature_pack_name(row: pd.Series) -> str:
+    value = row.get("feature_pack_name")
+    if _missing_scalar(value):
+        value = _stage2_row_recipe(row).get("feature_pack_name")
+    return str(value if not _missing_scalar(value) else "").strip()
+
+
+def _feature_pack_simplicity_rank(row: pd.Series) -> float:
+    if _stage2_row_model_type(row) == "stage1_pass_through":
+        return -1.0
+    return float(_FEATURE_PACK_SIMPLICITY_RANK.get(_stage2_row_feature_pack_name(row), 999.0))
+
+
+def _kernel_simplicity_rank(row: pd.Series) -> float:
+    if _stage2_row_model_type(row) == "stage1_pass_through":
+        return -1.0
+    kernel = str(row.get("kernel") if not _missing_scalar(row.get("kernel")) else "linear").strip().lower()
+    return float(_KERNEL_SIMPLICITY_RANK.get(kernel, 999.0))
+
+
+def _c_simplicity_rank(row: pd.Series) -> float:
+    if _stage2_row_model_type(row) == "stage1_pass_through":
+        return -1.0
+    value = row.get("C")
+    if _missing_scalar(value):
+        return 999.0
+    c_value = float(value)
+    if c_value <= 0:
+        return 999.0
+    return float(abs(math.log10(c_value)))
+
+
+def _degree_simplicity_rank(row: pd.Series) -> float:
+    if _stage2_row_model_type(row) == "stage1_pass_through":
+        return -1.0
+    kernel = str(row.get("kernel") if not _missing_scalar(row.get("kernel")) else "linear").strip().lower()
+    if kernel not in {"polynomial", "poly"}:
+        return 0.0
+    value = row.get("degree")
+    if _missing_scalar(value):
+        return 999.0
+    return float(value)
+
+
+def _gamma_simplicity_rank(row: pd.Series) -> float:
+    if _stage2_row_model_type(row) == "stage1_pass_through":
+        return -1.0
+    kernel = str(row.get("kernel") if not _missing_scalar(row.get("kernel")) else "linear").strip().lower()
+    if kernel == "linear":
+        return 0.0
+    value = row.get("gamma")
+    if _missing_scalar(value):
+        return 0.0
+    text = str(value).strip().lower()
+    if text == "auto":
+        return 0.0
+    if text == "scale":
+        return 1.0
+    gamma = float(value)
+    if gamma <= 0:
+        return 999.0
+    return float(2.0 + abs(math.log10(gamma)))
+
+
+def _add_stage2_selection_columns(stage2_df: pd.DataFrame) -> pd.DataFrame:
+    out = stage2_df.copy()
+    best_f1 = float(out["val_f1"].max()) if not out.empty else 0.0
+    out["stage2_f1_loss"] = best_f1 - out["val_f1"].astype(float)
+    out["feature_pack_simplicity_rank"] = out.apply(_feature_pack_simplicity_rank, axis=1)
+    out["model_type_simplicity_rank"] = out.apply(lambda row: float(_MODEL_TYPE_SIMPLICITY_RANK.get(_stage2_row_model_type(row), 999.0)), axis=1)
+    out["svm_kernel_simplicity_rank"] = out.apply(_kernel_simplicity_rank, axis=1)
+    out["svm_c_simplicity_rank"] = out.apply(_c_simplicity_rank, axis=1)
+    out["svm_degree_simplicity_rank"] = out.apply(_degree_simplicity_rank, axis=1)
+    out["svm_gamma_simplicity_rank"] = out.apply(_gamma_simplicity_rank, axis=1)
+    return out
+
+
+def _optimization_mode(cfg: dict[str, Any]) -> str:
+    return str(cfg.get("optimization_mode", "fixed_split")).strip().lower()
+
+
+def _require_fixed_split_mode(cfg: dict[str, Any]) -> str:
+    mode = _optimization_mode(cfg)
+    if mode != "fixed_split":
+        raise NotImplementedError(
+            "SNAPpy optimization_mode='cross_validation' is planned but not implemented yet. "
+            "Use optimization_mode: fixed_split with dataset_root containing train/ and val/ folders."
+        )
+    return mode
+
+
+def _write_optimization_split_records(run_dir: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    mode = _require_fixed_split_mode(cfg)
+    rows: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    image_ids: dict[str, list[str]] = {}
+    for split in ("train", "val"):
+        pairs = split_pairs(cfg["dataset_root"], split)
+        counts[split] = int(len(pairs))
+        image_ids[split] = [Path(image_path).stem for image_path, _ in pairs]
+        for image_path, label_path in pairs:
+            rows.append(
+                {
+                    "optimization_mode": mode,
+                    "fold_id": "fixed_split",
+                    "split": split,
+                    "image_id": Path(image_path).stem,
+                    "image_path": str(image_path),
+                    "label_path": str(label_path),
+                }
+            )
+    pd.DataFrame(rows).to_csv(run_dir / "optimization_splits.csv", index=False)
+    summary = {
+        "optimization_mode": mode,
+        "validation_strategy": "fixed user-supplied train/ and val/ folders",
+        "fold_count": 1,
+        "folds": [
+            {
+                "fold_id": "fixed_split",
+                "train_image_count": counts.get("train", 0),
+                "val_image_count": counts.get("val", 0),
+                "train_image_ids": image_ids.get("train", []),
+                "val_image_ids": image_ids.get("val", []),
+            }
+        ],
+    }
+    return summary
 
 
 def _stage1_screen_key(recipe: dict[str, Any]) -> str:
@@ -112,12 +276,128 @@ def _stage1_screen_key(recipe: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, default=str)
 
 
-def _stage2_shortlist_from_passed(passed_df: pd.DataFrame, top_k: int) -> tuple[pd.DataFrame, list[str]]:
+def _stage1_ranking_config(ranking_cfg: dict[str, Any] | None) -> dict[str, Any]:
+    ranking_cfg = ranking_cfg or {}
+    return {
+        "recall_tolerance": float(ranking_cfg.get("recall_tolerance", 0.02)),
+    }
+
+
+def _mean_per_image_candidate_ratio(image_rows: list[dict[str, Any]]) -> float:
+    """Average per-image candidate burden as candidates divided by ground-truth labels."""
+    return float(
+        sum(float(row["n_candidates"]) / max(float(row["n_labels"]), 1.0) for row in image_rows)
+        / max(len(image_rows), 1)
+    )
+
+
+def _stage1_guardrail_progress(
+    image_rows: list[dict[str, Any]],
+    *,
+    total_preflight_images: int,
+    preflight_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Determine whether a Stage 1 recipe can still pass the configured guardrails.
+
+    This is intentionally limited to Stage 1 guardrails. It does not use F1,
+    precision, runtime preference, or any winner-selection criterion.
+    """
+    processed_image_count = int(len(image_rows))
+    total_image_count = max(int(total_preflight_images), 1)
+    remaining_image_count = max(total_image_count - processed_image_count, 0)
+    candidate_count_so_far = float(sum(float(row["n_candidates"]) for row in image_rows))
+    recall_sum_so_far = float(sum(float(row["recall"]) for row in image_rows))
+    candidate_ratio_sum_so_far = float(
+        sum(float(row["n_candidates"]) / max(float(row["n_labels"]), 1.0) for row in image_rows)
+    )
+    max_candidates_so_far = int(max((int(row["n_candidates"]) for row in image_rows), default=0))
+
+    min_recall = preflight_cfg.get("min_stage1_recall_mean")
+    max_mean_candidates = preflight_cfg.get("max_stage1_candidates_mean")
+    max_single_candidates = preflight_cfg.get("max_stage1_candidates_single")
+    ratio_cap = _active_candidate_ratio_cap(preflight_cfg)
+
+    maximum_possible_mean_recall = float((recall_sum_so_far + remaining_image_count) / total_image_count)
+    minimum_possible_mean_candidates = float(candidate_count_so_far / total_image_count)
+    minimum_possible_candidate_ratio = float(candidate_ratio_sum_so_far / total_image_count)
+
+    definitive_failure_reasons: list[str] = []
+    if max_single_candidates is not None and max_candidates_so_far > float(max_single_candidates):
+        definitive_failure_reasons.append(
+            f"single-image candidates {max_candidates_so_far} > maximum {_format_guardrail_number(float(max_single_candidates))}"
+        )
+    if max_mean_candidates is not None and minimum_possible_mean_candidates > float(max_mean_candidates):
+        definitive_failure_reasons.append(
+            "minimum possible mean candidates "
+            f"{minimum_possible_mean_candidates:.1f} > maximum {float(max_mean_candidates):.1f}"
+        )
+    if min_recall is not None and maximum_possible_mean_recall < float(min_recall):
+        definitive_failure_reasons.append(
+            "maximum possible mean recall "
+            f"{maximum_possible_mean_recall:.4f} < minimum {float(min_recall):.4f}"
+        )
+    if ratio_cap is not None and minimum_possible_candidate_ratio > float(ratio_cap):
+        definitive_failure_reasons.append(
+            "minimum possible candidate/ground-truth ratio "
+            f"{minimum_possible_candidate_ratio:.2f} > maximum {float(ratio_cap):.2f}"
+        )
+
+    return {
+        "can_still_pass": not definitive_failure_reasons,
+        "definitive_failure_reasons": definitive_failure_reasons,
+        "processed_image_count": processed_image_count,
+        "total_image_count": total_image_count,
+        "remaining_image_count": remaining_image_count,
+        "maximum_possible_mean_recall": maximum_possible_mean_recall,
+        "minimum_possible_mean_candidates": minimum_possible_mean_candidates,
+        "minimum_possible_candidate_ratio": minimum_possible_candidate_ratio,
+    }
+
+
+def _stage1_ranked_passed_df(passed_df: pd.DataFrame, ranking_cfg: dict[str, Any] | None = None) -> pd.DataFrame:
+    """Rank passing Stage 1 recipes by the finalized recall-band/F1 policy.
+
+    Guardrails have already been applied before this function is called.
+    Only recipes within recall_tolerance of the best passing mean recall are
+    ranked for Stage 2 consideration. Recipes outside that recall band are
+    retained for audit output but are not eligible for Stage 2 shortlisting.
+    """
     passed_df = _ensure_preflight_sort_columns(passed_df)
-    sorted_passed = passed_df.sort_values(_PREFLIGHT_SORT_COLUMNS, ascending=_PREFLIGHT_SORT_ASCENDING)
+    if passed_df.empty:
+        return passed_df.copy()
+
+    cfg = _stage1_ranking_config(ranking_cfg)
+    recall_tolerance = float(cfg["recall_tolerance"])
+    best_recall = float(passed_df["mean_stage1_recall"].max())
+    recall_cutoff = best_recall - recall_tolerance
+
+    recall_eligible = passed_df[passed_df["mean_stage1_recall"].astype(float) >= recall_cutoff].copy()
+    ranked_recall_eligible = recall_eligible.sort_values(
+        ["mean_stage1_f1", "recipe_id"],
+        ascending=[False, True],
+    )
+    recall_ranked_ids = set(recall_eligible["recipe_id"].astype(str))
+    remaining = passed_df[~passed_df["recipe_id"].astype(str).isin(recall_ranked_ids)]
+    remaining = remaining.sort_values("recipe_id")
+    ordered = pd.concat([ranked_recall_eligible, remaining]).drop_duplicates(subset=["recipe_id"], keep="first").copy()
+    ordered["stage1_recall_eligible"] = ordered["recipe_id"].astype(str).isin(recall_ranked_ids)
+    ordered["stage1_recall_cutoff"] = recall_cutoff
+    ordered["stage1_best_recall"] = best_recall
+    ordered["stage1_ranking_recall_tolerance"] = recall_tolerance
+    return ordered
+
+
+def _stage2_shortlist_from_passed(
+    passed_df: pd.DataFrame,
+    top_k: int,
+    ranking_cfg: dict[str, Any] | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Select up to top_k unique Stage 1 configs from recall-eligible recipes."""
+    sorted_passed = _stage1_ranked_passed_df(passed_df, ranking_cfg)
+    eligible_passed = sorted_passed[sorted_passed["stage1_recall_eligible"].astype(bool)]
     selected_keys: list[str] = []
     selected_key_set: set[str] = set()
-    for _, row in sorted_passed.iterrows():
+    for _, row in eligible_passed.iterrows():
         key = str(row["stage1_key"])
         if key in selected_key_set:
             continue
@@ -125,58 +405,224 @@ def _stage2_shortlist_from_passed(passed_df: pd.DataFrame, top_k: int) -> tuple[
         selected_key_set.add(key)
         if len(selected_keys) >= int(top_k):
             break
-    shortlist = sorted_passed[sorted_passed["stage1_key"].astype(str).isin(selected_key_set)].copy()
+    shortlist = eligible_passed[eligible_passed["stage1_key"].astype(str).isin(selected_key_set)].copy()
     return shortlist, selected_keys
+
+
+def _leaderboard_stage1_cache_signatures(
+    preflight_rows: list[dict[str, Any]],
+    cfg: dict[str, Any],
+) -> set[str]:
+    if not preflight_rows:
+        return set()
+    df = pd.DataFrame(preflight_rows)
+    if "passed" not in df or "stage1_preflight_cache_signature" not in df:
+        return set()
+    passed_df = df[df["passed"]].copy()
+    if passed_df.empty:
+        return set()
+    shortlist, _ = _stage2_shortlist_from_passed(
+        passed_df,
+        top_k=int(cfg["optimizer"]["shortlist_top_k"]),
+        ranking_cfg=cfg["stage1_ranking"],
+    )
+    return set(shortlist["stage1_preflight_cache_signature"].dropna().astype(str))
+
+
+def _prune_stage1_cache_to_leaderboard(
+    preflight_rows: list[dict[str, Any]],
+    cfg: dict[str, Any],
+    val_pairs: list[tuple[Path, Path]],
+) -> int:
+    signatures = _leaderboard_stage1_cache_signatures(preflight_rows, cfg)
+    image_paths = [image_path for image_path, _ in val_pairs]
+    return prune_stage1_candidate_cache(allowed_signatures=signatures, image_paths=image_paths)
+
+
+def _promote_shortlisted_stage1_caches(
+    stage1_shortlist: pd.DataFrame,
+    *,
+    preflight_candidate_cap: int | None,
+    val_pairs: list[tuple[Path, Path]],
+) -> dict[str, int]:
+    promoted_candidates = 0
+    promoted_image_volumes = 0
+    seen: set[str] = set()
+    image_paths = [image_path for image_path, _ in val_pairs]
+    for _, row in stage1_shortlist.iterrows():
+        target_recipe = deepcopy(dict(row["recipe"]))
+        target_recipe.pop("max_candidates", None)
+        source_recipe = deepcopy(target_recipe)
+        if preflight_candidate_cap is not None:
+            source_recipe["max_candidates"] = int(preflight_candidate_cap)
+        source_signature = stage1_cache_signature(source_recipe)
+        if source_signature in seen:
+            continue
+        seen.add(source_signature)
+        promoted_candidates += promote_stage1_candidate_cache(
+            source_recipe=source_recipe,
+            target_recipe=target_recipe,
+            image_paths=image_paths,
+        )
+        promoted_image_volumes += promote_stage1_image_volume_cache(
+            recipe=source_recipe,
+            image_paths=image_paths,
+        )
+        promoted_image_volumes += promote_stage1_image_volume_cache(
+            recipe=target_recipe,
+            image_paths=image_paths,
+        )
+    return {
+        "candidate_entries": int(promoted_candidates),
+        "image_volume_entries": int(promoted_image_volumes),
+    }
+
+
+def _promote_shortlisted_stage1_image_volumes(
+    stage1_shortlist: pd.DataFrame,
+    *,
+    val_pairs: list[tuple[Path, Path]],
+) -> int:
+    promoted = 0
+    seen: set[str] = set()
+    image_paths = [image_path for image_path, _ in val_pairs]
+    for _, row in stage1_shortlist.iterrows():
+        recipe = deepcopy(dict(row["recipe"]))
+        recipe.pop("max_candidates", None)
+        signature = stage1_cache_signature(recipe)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        promoted += promote_stage1_image_volume_cache(recipe=recipe, image_paths=image_paths)
+    return promoted
+
+
+def _evaluate_full_val_stage1(passed_df: pd.DataFrame, cfg: dict[str, Any], val_pairs: list[tuple[Path, Path]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    match_kwargs = _match_distance_kwargs(cfg)
+    for _, row in passed_df.iterrows():
+        image_rows: list[dict[str, Any]] = []
+        recipe = dict(row["recipe"])
+        for image_path, label_path in val_pairs:
+            image_row = preflight_image(image_path, label_path, recipe, **match_kwargs)
+            image_rows.append(image_row)
+        n_images = len(image_rows)
+        total_tp = int(sum(image_row["tp"] for image_row in image_rows))
+        total_fp = int(sum(image_row["fp"] for image_row in image_rows))
+        total_fn = int(sum(image_row["fn"] for image_row in image_rows))
+        metrics = precision_recall_f1(total_tp, total_fp, total_fn)
+        total_candidates = int(sum(image_row["n_candidates"] for image_row in image_rows))
+        total_labels = int(sum(image_row["n_labels"] for image_row in image_rows))
+        rows.append(
+            {
+                "recipe_id": str(row["recipe_id"]),
+                "stage1_full_val_image_count": int(n_images),
+                "stage1_full_val_tp": total_tp,
+                "stage1_full_val_fp": total_fp,
+                "stage1_full_val_fn": total_fn,
+                "stage1_full_val_precision": float(metrics["precision"]),
+                "stage1_full_val_recall": float(metrics["recall"]),
+                "stage1_full_val_f1": float(metrics["f1"]),
+                "stage1_full_val_mean_tp": float(total_tp / max(n_images, 1)),
+                "stage1_full_val_mean_candidates": float(total_candidates / max(n_images, 1)),
+                "stage1_full_val_candidate_ratio": float(total_candidates / max(total_labels, 1)),
+                "mean_stage1_candidate_ratio": float(row.get("mean_stage1_candidate_ratio", float("inf"))),
+                "recipe": recipe,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _ensure_preflight_sort_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    if "processing_cost_rank" not in out:
-        out["processing_cost_rank"] = 0.0
+    if "mean_stage1_candidate_ratio" not in out:
+        if {"mean_stage1_candidates", "mean_stage1_label_count"}.issubset(out.columns):
+            out["mean_stage1_candidate_ratio"] = out["mean_stage1_candidates"].astype(float) / out["mean_stage1_label_count"].astype(float).clip(lower=1.0)
+        else:
+            out["mean_stage1_candidate_ratio"] = float("inf")
+    if "mean_stage1_f1" not in out:
+        if {"mean_stage1_precision", "mean_stage1_recall"}.issubset(out.columns):
+            precision = out["mean_stage1_precision"].astype(float)
+            recall = out["mean_stage1_recall"].astype(float)
+            out["mean_stage1_f1"] = (2.0 * precision * recall / (precision + recall).replace(0.0, np.nan)).fillna(0.0)
+        else:
+            out["mean_stage1_f1"] = 0.0
     return out
 
 
-def _compact_stage1_recipe(recipe: dict[str, Any]) -> dict[str, Any]:
-    keys = [
-        "recipe_id",
-        "stage1_recipe_id",
-        "stage1_dedup_key",
-        "deduplicated_duplicate_count",
-        *_STAGE1_SCREEN_FIELDS,
-    ]
-    return {key: _json_scalar(recipe.get(key)) for key in keys if key in recipe}
+def _fitting_mode_rank(value: Any) -> float:
+    return float(_FITTING_MODE_SIMPLICITY_RANK.get(str(value or "").strip().lower(), 999.0))
 
 
-def _write_stage1_recipes_csv(path: Path, stage1_recipes: list[dict[str, Any]]) -> None:
-    rows = [_compact_stage1_recipe(recipe) for recipe in stage1_recipes]
-    pd.DataFrame(rows).to_csv(path, index=False)
+def _simplest_fitting_mode(stage1_recipe: dict[str, Any], cfg: dict[str, Any]) -> str:
+    values: list[Any] = []
+    recipe_value = stage1_recipe.get("fit_method")
+    if isinstance(recipe_value, list):
+        values.extend(recipe_value)
+    elif recipe_value is not None:
+        values.append(recipe_value)
+    default_value = cfg.get("pipeline_defaults", {}).get("fit_method")
+    if isinstance(default_value, list):
+        values.extend(default_value)
+    elif default_value is not None:
+        values.append(default_value)
+    if not values:
+        values.append(_DEFAULT_FITTING_MODE)
+    return str(sorted(values, key=_fitting_mode_rank)[0])
 
 
-def _write_stage2_recipes_csv(path: Path, stage2_df: pd.DataFrame) -> None:
-    rows: list[dict[str, Any]] = []
-    if stage2_df.empty:
-        pd.DataFrame(rows).to_csv(path, index=False)
-        return
-    for _, row in stage2_df.iterrows():
-        recipe = dict(row["recipe"])
-        rows.append(
+def _stage1_pass_through_recipe(stage1_recipe: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    recipe = deepcopy(stage1_recipe)
+    # Stage 1 pass-through is a no-SVM winning-model option for the rare case
+    # where a shortlisted Stage 1 recipe produces only positive training
+    # candidates. The model remains preprocessing + local maxima detection +
+    # Gaussian fitting only; feature extraction and Stage 2 SVM classification
+    # are intentionally not used.
+    recipe["stage1_recipe_id"] = stage1_recipe["recipe_id"]
+    recipe["fit_method"] = _simplest_fitting_mode(stage1_recipe, cfg)
+    recipe["feature_pack_name"] = "not_applicable"
+    recipe["selected_features"] = []
+    recipe["feature_cache_features"] = []
+    recipe["model_type"] = "stage1_pass_through"
+    recipe["stage1_train_label_status"] = "all_positive_stage1"
+    recipe["recipe_id"] = f"{stage1_recipe['recipe_id']}_stage1_pass_through"
+    return recipe
+
+
+def _annotate_stage1_train_label_status(stage1_shortlist: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
+    if stage1_shortlist.empty:
+        return stage1_shortlist.copy()
+    out = stage1_shortlist.copy()
+    summary_rows: list[dict[str, Any]] = []
+    match_kwargs = _match_distance_kwargs(cfg)
+    for _, row in out.iterrows():
+        summary = summarize_stage1_candidate_labels(
+            cfg["dataset_root"],
+            "train",
+            dict(row["recipe"]),
+            **match_kwargs,
+        )
+        if summary["all_positive_candidates"]:
+            status = "all_positive_stage1"
+        elif summary["no_training_candidates"]:
+            status = "no_training_candidates"
+        elif summary["no_true_positive_candidates"]:
+            status = "no_true_positive_training_candidates"
+        else:
+            status = "two_class_training_candidates"
+        summary_rows.append(
             {
-                "stage2_id": row["recipe_id"],
-                "stage1_id": row.get("stage1_recipe_id"),
-                "feature_pack_name": recipe.get("feature_pack_name"),
-                "selected_features": ";".join(str(item) for item in recipe.get("selected_features", [])),
-                "fit_variant_id": recipe.get("fit_variant_id"),
-                "fit_method": recipe.get("fit_method"),
-                "fit_window": recipe.get("fit_window"),
-                "svm_kernel": row.get("kernel"),
-                "svm_C": row.get("C"),
-                "svm_gamma": row.get("gamma"),
-                "svm_degree": row.get("degree"),
-                "svm_standardize": row.get("standardize"),
-                "svm_class_weight_mode": row.get("class_weight_mode"),
+                "recipe_id": row["recipe_id"],
+                "stage1_train_label_status": status,
+                "stage1_train_images": int(summary["n_images"]),
+                "stage1_train_candidates": int(summary["n_candidates"]),
+                "stage1_train_positive_candidates": int(summary["n_positive_candidates"]),
+                "stage1_train_negative_candidates": int(summary["n_negative_candidates"]),
+                "stage1_train_ground_truth": int(summary["n_ground_truth"]),
             }
         )
-    pd.DataFrame(rows).to_csv(path, index=False)
+    summary_df = pd.DataFrame(summary_rows)
+    return out.merge(summary_df, on="recipe_id", how="left")
 
 
 def _expand_stage2_shortlist(
@@ -185,22 +631,31 @@ def _expand_stage2_shortlist(
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for _, stage1_row in stage1_shortlist.iterrows():
+        if str(stage1_row.get("stage1_train_label_status", "")).strip().lower() == "all_positive_stage1":
+            recipe = _stage1_pass_through_recipe(deepcopy(stage1_row["recipe"]), cfg)
+            row = stage1_row.drop(labels=["recipe"]).to_dict()
+            row["stage1_recipe_id"] = stage1_row["recipe_id"]
+            row["recipe_id"] = recipe["recipe_id"]
+            row["feature_pack_name"] = recipe.get("feature_pack_name")
+            row["fitting_mode"] = recipe.get("fit_method")
+            row["model_type"] = "stage1_pass_through"
+            row["recipe"] = deepcopy(recipe)
+            rows.append(row)
+            continue
         stage2_recipes = stage2_recipe_bank(cfg, [deepcopy(stage1_row["recipe"])])
         for recipe in stage2_recipes:
             row = stage1_row.drop(labels=["recipe"]).to_dict()
             row["stage1_recipe_id"] = stage1_row["recipe_id"]
             row["recipe_id"] = recipe["recipe_id"]
             row["feature_pack_name"] = recipe.get("feature_pack_name")
-            row["fit_variant_id"] = recipe.get("fit_variant_id")
-            row["fit_cost_rank"] = _fit_cost_rank(recipe)
-            row["feature_count"] = len(recipe.get("selected_features") or [])
+            row["fitting_mode"] = recipe.get("fit_method")
             row["recipe"] = deepcopy(recipe)
             rows.append(row)
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows).sort_values(
-        ["stage1_rank_passed", "fit_cost_rank", "feature_count", "recipe_id"],
-        ascending=[True, True, True, True],
+        ["stage1_rank_passed", "recipe_id"],
+        ascending=[True, True],
     )
 
 
@@ -216,6 +671,9 @@ def _optimizer_plan_from_materialized(
     return {
         "dataset_name": cfg.get("dataset_name"),
         "dataset_root": cfg.get("dataset_root"),
+        "optimization_mode": _optimization_mode(cfg),
+        "validation_strategy": "fixed user-supplied train/ and val/ folders",
+        "matching": _match_distance_summary(cfg),
         "dataset_profile": profile,
         "stage1_recipe_bank_entries": int(len(stage1_recipes)),
         "unique_stage1_preflight_configs": int(len(stage1_recipes)),
@@ -225,14 +683,16 @@ def _optimizer_plan_from_materialized(
         "max_stage2_recipe_entries_after_shortlist": max_stage2_after_shortlist,
         "svm_param_grid_entries_per_stage2_recipe": int(svm_grid_entries),
         "max_svm_fits_after_shortlist": int(max_stage2_after_shortlist * svm_grid_entries),
-        "svm_selection": "fit each SVM configuration on train/ and select by validation performance on all val/ images",
+        "svm_selection": "fit each SVM configuration on train/ and select by mean per-image validation performance on all val/ images",
         "safety_caps": {
             "max_stage1_preflight_configs": cfg["optimizer"].get("max_stage1_preflight_configs"),
             "max_stage2_recipes_after_shortlist": cfg["optimizer"].get("max_stage2_recipes_after_shortlist"),
         },
         "execution_order": [
             "evaluate unique Stage 1 candidate-generation configurations only",
-            "rank passing Stage 1 configurations by preflight utility, recall, precision, deterministic id",
+            "apply only the Stage 1 guardrails explicitly configured by the user",
+            "keep passing Stage 1 configurations within the recall tolerance of best mean recall",
+            "rank recall-eligible Stage 1 configurations by higher mean F1, then deterministic id",
             "shortlist Stage 1 configurations",
             "expand shortlisted Stage 1 configurations into Stage 2 feature-pack/fit recipes",
             "train/evaluate Stage 2 recipes and choose final winner",
@@ -262,10 +722,10 @@ def optimizer_plan(config_path: str | Path, enforce_safety: bool = True) -> dict
     cfg = load_config(config_path)
     if cfg.get("dataset_root"):
         profile = _profile_dataset(cfg)
-        cfg = _apply_profile_guidance(cfg, profile)
     else:
         profile = {"enabled": False, "reason": "dataset_root is not set"}
-    explicit_recipes = bool(cfg.get("recipes"))
+    cfg = _apply_profile_guidance(cfg, profile)
+    explicit_recipes = str(cfg.get("stage1_detector_set", "")).strip().lower() == "custom"
     stage1_recipes = stage1_recipe_bank(cfg)
     stage1_recipes = _apply_runtime_recipe_guidance(stage1_recipes, cfg, profile, explicit_recipes=explicit_recipes)
     plan = _optimizer_plan_from_materialized(cfg, profile, stage1_recipes)
@@ -283,19 +743,26 @@ def _stage1_failure_reasons(
     preflight_cfg: dict[str, Any],
 ) -> list[str]:
     reasons: list[str] = []
-    min_recall = float(preflight_cfg["min_stage1_recall"])
-    max_mean_candidates = float(preflight_cfg["max_stage1_candidates_mean"])
-    max_single_candidates = int(preflight_cfg["max_stage1_candidates_single"])
-    ratio_cap = preflight_cfg.get("max_stage1_candidates_per_label_mean")
-    if float(mean_recall) < min_recall:
-        reasons.append(f"recall {float(mean_recall):.4f} < minimum {min_recall:.4f}")
-    if float(mean_candidates) > max_mean_candidates:
-        reasons.append(f"mean candidates {float(mean_candidates):.1f} > maximum {max_mean_candidates:.1f}")
-    if int(max_candidates) > max_single_candidates:
-        reasons.append(f"single-image candidates {int(max_candidates)} > maximum {max_single_candidates}")
+    min_recall = preflight_cfg.get("min_stage1_recall_mean")
+    max_mean_candidates = preflight_cfg.get("max_stage1_candidates_mean")
+    max_single_candidates = preflight_cfg.get("max_stage1_candidates_single")
+    ratio_cap = _active_candidate_ratio_cap(preflight_cfg)
+    if min_recall is not None and float(mean_recall) < float(min_recall):
+        reasons.append(f"mean recall {float(mean_recall):.4f} < minimum {float(min_recall):.4f}")
+    if max_mean_candidates is not None and float(mean_candidates) > float(max_mean_candidates):
+        reasons.append(f"mean candidates {float(mean_candidates):.1f} > maximum {float(max_mean_candidates):.1f}")
+    if max_single_candidates is not None and int(max_candidates) > float(max_single_candidates):
+        reasons.append(f"single-image candidates {int(max_candidates)} > maximum {_format_guardrail_number(float(max_single_candidates))}")
     if ratio_cap is not None and float(mean_candidate_ratio) > float(ratio_cap):
-        reasons.append(f"candidate/label ratio {float(mean_candidate_ratio):.2f} > maximum {float(ratio_cap):.2f}")
+        reasons.append(f"candidate/ground-truth ratio {float(mean_candidate_ratio):.2f} > maximum {float(ratio_cap):.2f}")
     return reasons
+
+
+def _format_guardrail_number(value: float) -> str:
+    numeric = float(value)
+    if numeric.is_integer():
+        return str(int(numeric))
+    return f"{numeric:g}"
 
 
 def _preflight_pass_label(reasons: list[str]) -> str:
@@ -306,6 +773,7 @@ def _apply_preflight_decision_columns(
     preflight_df: pd.DataFrame,
     shortlist_ids: set[str] | None = None,
     stage2_ids: set[str] | None = None,
+    ranking_cfg: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     out = _ensure_preflight_sort_columns(preflight_df)
     shortlist_ids = shortlist_ids or set()
@@ -313,20 +781,43 @@ def _apply_preflight_decision_columns(
     if out.empty:
         return out
 
-    sorted_all = out.sort_values(
-        ["passed", *_PREFLIGHT_SORT_COLUMNS],
-        ascending=[False, *_PREFLIGHT_SORT_ASCENDING],
-    )
-    all_rank = pd.Series(range(1, len(sorted_all) + 1), index=sorted_all.index, dtype="int64")
-    out["stage1_rank_all"] = all_rank
+    out["stage1_recall_eligible"] = False
+    out["stage1_recall_cutoff"] = pd.NA
+    out["stage1_best_recall"] = pd.NA
+    out["stage1_ranking_recall_tolerance"] = pd.NA
     out["stage1_rank_passed"] = pd.NA
-    passed_sorted = out[out["passed"]].sort_values(_PREFLIGHT_SORT_COLUMNS, ascending=_PREFLIGHT_SORT_ASCENDING)
-    if not passed_sorted.empty:
-        passed_rank = pd.Series(range(1, len(passed_sorted) + 1), index=passed_sorted.index, dtype="int64")
-        out.loc[passed_sorted.index, "stage1_rank_passed"] = passed_rank
+    passed_ranked = _stage1_ranked_passed_df(out[out["passed"]], ranking_cfg)
+    if not passed_ranked.empty:
+        copied_cols = [
+            "stage1_recall_eligible",
+            "stage1_recall_cutoff",
+            "stage1_best_recall",
+            "stage1_ranking_recall_tolerance",
+        ]
+        out.loc[passed_ranked.index, copied_cols] = passed_ranked[copied_cols]
+        eligible_ranked = passed_ranked[passed_ranked["stage1_recall_eligible"].astype(bool)]
+        if not eligible_ranked.empty:
+            passed_rank = pd.Series(range(1, len(eligible_ranked) + 1), index=eligible_ranked.index, dtype="int64")
+            out.loc[eligible_ranked.index, "stage1_rank_passed"] = passed_rank
     out["shortlisted_for_stage2"] = out["recipe_id"].astype(str).isin(shortlist_ids)
     out["selected_for_stage2"] = out["recipe_id"].astype(str).isin(stage2_ids)
-    return out.sort_values(["stage1_rank_all", "recipe_id"], ascending=[True, True])
+    report_order = pd.Series(len(out), index=out.index, dtype="int64")
+    ranked = out[out["stage1_rank_passed"].notna()].sort_values("stage1_rank_passed")
+    if not ranked.empty:
+        report_order.loc[ranked.index] = range(0, len(ranked))
+    unranked_passed = out[(out["passed"]) & (out["stage1_rank_passed"].isna())].sort_values("recipe_id")
+    if not unranked_passed.empty:
+        start = int(report_order.loc[ranked.index].max() + 1) if not ranked.empty else 0
+        report_order.loc[unranked_passed.index] = range(start, start + len(unranked_passed))
+    failed = out[~out["passed"]].sort_values("recipe_id")
+    if not failed.empty:
+        start = int(report_order.loc[out["passed"]].max() + 1) if bool(out["passed"].any()) else 0
+        report_order.loc[failed.index] = range(start, start + len(failed))
+    return (
+        out.assign(_stage1_report_order=report_order)
+        .sort_values(["_stage1_report_order", "recipe_id"], ascending=[True, True])
+        .drop(columns=["_stage1_report_order"])
+    )
 
 
 def _json_scalar(value: Any) -> Any:
@@ -345,189 +836,511 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, default=str) + "\n")
 
 
-def _table_records(df: pd.DataFrame, columns: list[str], limit: int) -> list[dict[str, Any]]:
-    if df.empty:
+def _remove_optimizer_progress_files(run_dir: Path) -> None:
+    for name in ("preflight_progress.jsonl", "stage2_progress.jsonl"):
+        path = run_dir / name
+        if path.exists():
+            path.unlink()
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_ready(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_json_ready(val) for val in value]
+    if isinstance(value, tuple):
+        return [_json_ready(val) for val in value]
+    return _json_scalar(value)
+
+
+def _stage1_score_payload(winner: pd.Series) -> dict[str, Any]:
+    return {
+        "rank_passed": _json_scalar(winner.get("stage1_rank_passed")),
+        "mean_recall": _json_scalar(winner.get("mean_stage1_recall")),
+        "mean_precision": _json_scalar(winner.get("mean_stage1_precision")),
+        "mean_f1": _json_scalar(winner.get("mean_stage1_f1")),
+        "mean_candidates": _json_scalar(winner.get("mean_stage1_candidates")),
+        "mean_candidate_ratio": _json_scalar(winner.get("mean_stage1_candidate_ratio")),
+        "max_candidates": _json_scalar(winner.get("max_stage1_candidates")),
+        "decision": _json_scalar(winner.get("stage1_decision")),
+    }
+
+
+def _validation_metric_payload(winner: pd.Series) -> dict[str, Any]:
+    return {
+        "selection_metric": "mean per-image F1",
+        "tp": int(winner.get("val_tp", 0)),
+        "fp": int(winner.get("val_fp", 0)),
+        "fn": int(winner.get("val_fn", 0)),
+        "precision_mean_image": float(winner.get("val_precision_mean_image", winner.get("val_precision", 0.0))),
+        "recall_mean_image": float(winner.get("val_recall_mean_image", winner.get("val_recall", 0.0))),
+        "f1_mean_image": float(winner.get("val_f1_mean_image", winner.get("val_f1", 0.0))),
+        "precision_pooled": float(winner.get("val_precision_pooled", 0.0)),
+        "recall_pooled": float(winner.get("val_recall_pooled", 0.0)),
+        "f1_pooled": float(winner.get("val_f1_pooled", 0.0)),
+    }
+
+
+def _svm_parameter_payload(winner: pd.Series) -> dict[str, Any] | None:
+    if _is_stage1_pass_through_row(winner):
+        return None
+    return {
+        "kernel": _json_scalar(winner.get("kernel")),
+        "C": _json_scalar(winner.get("C")),
+        "gamma": _json_scalar(winner.get("gamma")),
+        "degree": _json_scalar(winner.get("degree")),
+        "standardize": _json_scalar(winner.get("standardize")),
+        "class_weighting": _json_scalar(winner.get("class_weighting")),
+    }
+
+
+def _stage2_parameter_payload(recipe: dict[str, Any], winner: pd.Series) -> dict[str, Any]:
+    pass_through = _is_stage1_pass_through_row(winner)
+    payload = {
+        "model_type": "stage1_pass_through" if pass_through else "svm",
+        "fitting_mode": recipe.get("fit_method"),
+        "fit_window": recipe.get("fit_window"),
+        "fit_background_width": recipe.get("fit_background_width"),
+        "fit_max_iterations": recipe.get("fit_max_iterations"),
+        "fit_tolerance": recipe.get("fit_tolerance"),
+        "feature_pack_name": recipe.get("feature_pack_name"),
+        "selected_features": list(recipe.get("selected_features") or []),
+        "svm": _svm_parameter_payload(winner),
+    }
+    if pass_through:
+        payload["decision_rule"] = "accept_all_stage1_candidates"
+        payload["decision_threshold"] = None
+    else:
+        payload["decision_threshold"] = float(winner.get("decision_threshold", 0.0))
+    return payload
+
+
+def _stage2_finalist_records(finalists: pd.DataFrame, winner: pd.Series) -> list[dict[str, Any]]:
+    if finalists.empty:
         return []
-    rows: list[dict[str, Any]] = []
-    for _, row in df.head(int(limit)).iterrows():
-        rows.append({col: _json_scalar(row[col]) for col in columns if col in row.index})
-    return rows
-
-
-def _failure_reason_counts(preflight_df: pd.DataFrame) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    if "stage1_decision" not in preflight_df:
-        return counts
-    for text in preflight_df.loc[~preflight_df["passed"], "stage1_decision"].astype(str):
-        for reason in text.split("; "):
-            if not reason:
-                continue
-            counts[reason] = counts.get(reason, 0) + 1
-    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
-
-
-def _compact_recipe(recipe: dict[str, Any]) -> dict[str, Any]:
-    keys = [
+    columns = [
         "recipe_id",
+        "stage1_recipe_id",
+        "feature_pack_name",
+        "fitting_mode",
+        "val_f1",
+        "val_precision",
+        "val_recall",
+        "val_f1_pooled",
+        "stage2_f1_loss",
+        "feature_pack_simplicity_rank",
+        "model_type_simplicity_rank",
+        "svm_kernel_simplicity_rank",
+        "svm_c_simplicity_rank",
+        "svm_degree_simplicity_rank",
+        "svm_gamma_simplicity_rank",
+        "stage1_rank_passed",
+        "decision_threshold",
+        "kernel",
+        "C",
+        "gamma",
+        "degree",
+        "standardize",
+        "class_weighting",
+    ]
+    records: list[dict[str, Any]] = []
+    for _, row in finalists.sort_values(_FINALIST_SORT_COLUMNS, ascending=_FINALIST_SORT_ASCENDING).iterrows():
+        record = {col: _json_scalar(row[col]) for col in columns if col in row.index}
+        record["winner"] = str(row["recipe_id"]) == str(winner["recipe_id"])
+        records.append(record)
+    return records
+
+
+def _stage1_parameter_payload(recipe: dict[str, Any]) -> dict[str, Any]:
+    return {key: _json_ready(recipe.get(key)) for key in _STAGE1_SCREEN_FIELDS if key in recipe}
+
+
+def _stage1_shortlist_records(stage1_shortlist: pd.DataFrame) -> list[dict[str, Any]]:
+    if stage1_shortlist.empty:
+        return []
+    rows = stage1_shortlist.sort_values(["stage1_rank_passed", "recipe_id"], ascending=[True, True])
+    records: list[dict[str, Any]] = []
+    metric_columns = [
+        "stage1_rank_passed",
+        "stage1_recall_eligible",
+        "stage1_best_recall",
+        "stage1_recall_cutoff",
+        "stage1_ranking_recall_tolerance",
+        "mean_stage1_recall",
+        "mean_stage1_precision",
+        "mean_stage1_f1",
+        "total_stage1_tp",
+        "total_stage1_fp",
+        "total_stage1_fn",
+        "mean_stage1_candidates",
+        "mean_stage1_label_count",
+        "mean_stage1_candidate_ratio",
+        "max_stage1_candidates",
+        "stage1_preflight_images_processed",
+        "stage1_preflight_images_total",
+        "stage1_full_val_image_count",
+        "stage1_full_val_tp",
+        "stage1_full_val_fp",
+        "stage1_full_val_fn",
+        "stage1_full_val_precision",
+        "stage1_full_val_recall",
+        "stage1_full_val_f1",
+        "stage1_full_val_mean_tp",
+        "stage1_full_val_mean_candidates",
+        "stage1_full_val_candidate_ratio",
+        "stage1_train_label_status",
+        "stage1_train_images",
+        "stage1_train_candidates",
+        "stage1_train_positive_candidates",
+        "stage1_train_negative_candidates",
+        "stage1_train_ground_truth",
+        "stage2_recipe_count",
+    ]
+    for _, row in rows.iterrows():
+        recipe = dict(row.get("recipe", {}))
+        record = {
+            "stage1_recipe_id": str(row.get("recipe_id")),
+            "stage1_key": _json_scalar(row.get("stage1_key")),
+            "stage1_parameters": _stage1_parameter_payload(recipe),
+        }
+        for column in metric_columns:
+            if column in row.index:
+                record[column] = _json_scalar(row[column])
+        records.append(record)
+    return records
+
+
+def _stage1_guardrail_summary(
+    cfg: dict[str, Any],
+    *,
+    requested_preflight_image_count: int | str,
+    preflight_image_count: int,
+    available_validation_image_count: int,
+) -> dict[str, Any]:
+    preflight_cfg = cfg["preflight"]
+    return {
+        "stage1_n_val_images_requested": requested_preflight_image_count,
+        "stage1_n_val_images_used": int(preflight_image_count),
+        "available_validation_image_count": int(available_validation_image_count),
+        "min_stage1_recall_mean": _json_scalar(preflight_cfg.get("min_stage1_recall_mean")),
+        "max_stage1_candidates_mean": _json_scalar(preflight_cfg.get("max_stage1_candidates_mean")),
+        "max_stage1_candidates_single": _json_scalar(preflight_cfg.get("max_stage1_candidates_single")),
+        "max_candidate_ratio_cap_mean": _json_scalar(preflight_cfg.get("max_candidate_ratio_cap_mean")),
+        "disabled_guardrails": [
+            key
+            for key in (
+                "min_stage1_recall_mean",
+                "max_stage1_candidates_mean",
+                "max_stage1_candidates_single",
+                "max_candidate_ratio_cap_mean",
+            )
+            if preflight_cfg.get(key) is None
+        ],
+    }
+
+
+def _stage1_ranking_summary(cfg: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "recall_tolerance": float(cfg["stage1_ranking"]["recall_tolerance"]),
+        "shortlist_top_k": int(cfg["optimizer"]["shortlist_top_k"]),
+        "ranking_order": [
+            "apply configured Stage 1 guardrails",
+            "keep passing recipes with mean recall within recall_tolerance of the best passing recipe",
+            "rank recall-eligible recipes by higher mean Stage 1 F1",
+            "break exact ties by recipe_id",
+            "send the top shortlist_top_k unique Stage 1 configurations to Stage 2",
+        ],
+    }
+
+
+def _stage2_winner_record(winner: pd.Series) -> dict[str, Any]:
+    recipe = dict(winner["recipe"])
+    pass_through = _is_stage1_pass_through_row(winner)
+    return {
+        "stage2_recipe_id": str(winner["recipe_id"]),
+        "origin_stage1_recipe_id": str(winner.get("stage1_recipe_id", "")),
+        "origin_stage1_rank_passed": _json_scalar(winner.get("stage1_rank_passed")),
+        "model_type": "stage1_pass_through" if pass_through else "svm",
+        "feature_pack_name": recipe.get("feature_pack_name"),
+        "selected_features": list(recipe.get("selected_features") or []),
+        "fitting_mode": recipe.get("fit_method"),
+        "fit_window": recipe.get("fit_window"),
+        "svm": _svm_parameter_payload(winner),
+        "decision_threshold": None if pass_through else float(winner.get("decision_threshold", 0.0)),
+        "validation_metrics": _validation_metric_payload(winner),
+        "stage1_score": _stage1_score_payload(winner),
+    }
+
+
+def _format_summary_value(value: Any, digits: int = 4) -> str:
+    value = _json_scalar(value)
+    if value is None:
+        return "not used"
+    if isinstance(value, float):
+        return f"{value:.{digits}f}"
+    return str(value)
+
+
+def _markdown_table(headers: list[str], rows: list[list[Any]]) -> list[str]:
+    if not rows:
+        return ["No rows."]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(str(item) for item in row) + " |")
+    return lines
+
+
+def _stage1_parameter_brief(parameters: dict[str, Any]) -> str:
+    fields = [
         "maxima_method",
         "preproc_sigma",
+        "preproc_sigma_nm",
         "background_enabled",
         "background_method",
         "background_param",
+        "background_param_nm",
         "sigma_value",
+        "sigma_nm",
         "threshold_value",
         "h_max_sigma_multiplier",
         "h_max_sigma_mode",
         "maxima_neighborhood",
-        "fit_method",
-        "fit_window",
-        "feature_pack_name",
+        "maxima_min_distance_nm",
     ]
-    return {key: _json_scalar(recipe.get(key)) for key in keys if key in recipe}
+    parts = [f"{key}={_format_summary_value(parameters[key])}" for key in fields if key in parameters]
+    return ", ".join(parts)
 
 
-def _write_selection_decision_record(
+def _summary_markdown_lines(
+    *,
+    cfg: dict[str, Any],
+    mode: str,
+    split_summary: dict[str, Any],
+    profile: dict[str, Any],
+    final_model_path: Path,
+    stage1_guardrails: dict[str, Any],
+    stage1_ranking: dict[str, Any],
+    stage1_shortlist_records: list[dict[str, Any]],
+    stage2_winner: dict[str, Any],
+) -> list[str]:
+    lines = [
+        "# SNAPpy Optimized Model",
+        "",
+        "## Model Output",
+        f"- Model for future `mrsnappy detect`: `{final_model_path}`",
+        "- Complete model record: `model_config.json`",
+        "- Human-readable model summary: `model_summary.md`",
+        "- Train/validation split record: `optimization_splits.csv`",
+        "",
+        "## Dataset",
+        f"- Dataset: `{cfg['dataset_name']}`",
+        f"- Optimization mode: `{mode}`",
+        "- Validation strategy: fixed user-supplied `train/` and `val/` folders.",
+        f"- Train images: `{split_summary['folds'][0]['train_image_count']}`",
+        f"- Validation images: `{split_summary['folds'][0]['val_image_count']}`",
+        f"- Density regime: `{profile.get('density_regime', 'unknown')}`",
+        f"- Contrast regime: `{profile.get('contrast_regime', 'unknown')}`",
+        f"- Background regime: `{profile.get('background_regime', 'unknown')}`",
+        "",
+        "## Stage 1 Guardrails",
+        f"- Preflight validation images requested: `{stage1_guardrails['stage1_n_val_images_requested']}`",
+        f"- Preflight validation images used: `{stage1_guardrails['stage1_n_val_images_used']}` of `{stage1_guardrails['available_validation_image_count']}` available validation images.",
+        f"- Minimum mean recall: `{_format_summary_value(stage1_guardrails['min_stage1_recall_mean'])}`",
+        f"- Maximum mean candidates per image: `{_format_summary_value(stage1_guardrails['max_stage1_candidates_mean'], digits=1)}`",
+        f"- Maximum candidates in a single image: `{_format_summary_value(stage1_guardrails['max_stage1_candidates_single'], digits=1)}`",
+        f"- Maximum mean candidate/GT ratio: `{_format_summary_value(stage1_guardrails['max_candidate_ratio_cap_mean'], digits=2)}`",
+        "",
+        "## Stage 1 Ranking",
+        f"- Recall tolerance: `{stage1_ranking['recall_tolerance']:.4f}`",
+        f"- Stage 1 recipes sent to Stage 2: top `{stage1_ranking['shortlist_top_k']}` unique Stage 1 configurations after guardrails, recall-band filtering, F1 ranking, and recipe-id tie breaking.",
+        "",
+        "## Stage 1 Winning Recipes",
+    ]
+    lines.extend(
+        _markdown_table(
+            [
+                "rank",
+                "stage1_recipe_id",
+                "recall",
+                "precision",
+                "f1",
+                "tp/fp/fn",
+                "mean candidates",
+                "cand/GT",
+                "max candidates",
+                "train labels",
+            ],
+            [
+                [
+                    _format_summary_value(row.get("stage1_rank_passed"), digits=0),
+                    f"`{row['stage1_recipe_id']}`",
+                    _format_summary_value(row.get("mean_stage1_recall")),
+                    _format_summary_value(row.get("mean_stage1_precision")),
+                    _format_summary_value(row.get("mean_stage1_f1")),
+                    f"{_format_summary_value(row.get('total_stage1_tp'), digits=0)}/{_format_summary_value(row.get('total_stage1_fp'), digits=0)}/{_format_summary_value(row.get('total_stage1_fn'), digits=0)}",
+                    _format_summary_value(row.get("mean_stage1_candidates"), digits=1),
+                    _format_summary_value(row.get("mean_stage1_candidate_ratio"), digits=2),
+                    _format_summary_value(row.get("max_stage1_candidates"), digits=0),
+                    _format_summary_value(row.get("stage1_train_label_status")),
+                ]
+                for row in stage1_shortlist_records
+            ],
+        )
+    )
+    lines.extend(["", "### Stage 1 Recipe Parameters"])
+    for row in stage1_shortlist_records:
+        brief = _stage1_parameter_brief(row["stage1_parameters"])
+        lines.append(f"- Rank `{_format_summary_value(row.get('stage1_rank_passed'), digits=0)}` `{row['stage1_recipe_id']}`: {brief}")
+    lines.extend(
+        [
+            "",
+            "## Stage 2 Winner",
+            f"- Stage 2 recipe: `{stage2_winner['stage2_recipe_id']}`",
+            f"- Originating Stage 1 recipe: `{stage2_winner['origin_stage1_recipe_id']}`",
+            f"- Originating Stage 1 rank: `{_format_summary_value(stage2_winner['origin_stage1_rank_passed'], digits=0)}`",
+            f"- Model type: `{stage2_winner['model_type']}`",
+            f"- Feature pack: `{stage2_winner['feature_pack_name']}`",
+            f"- Fitting mode: `{stage2_winner['fitting_mode']}`",
+            f"- Selected feature count: `{len(stage2_winner['selected_features'])}`",
+            f"- SVM parameters: `{json.dumps(stage2_winner['svm'], sort_keys=True) if stage2_winner['svm'] is not None else 'none'}`",
+            f"- Decision threshold: `{_format_summary_value(stage2_winner['decision_threshold'], digits=6)}`",
+            f"- Validation F1, mean per image: `{stage2_winner['validation_metrics']['f1_mean_image']:.6f}`",
+            f"- Validation precision, mean per image: `{stage2_winner['validation_metrics']['precision_mean_image']:.6f}`",
+            f"- Validation recall, mean per image: `{stage2_winner['validation_metrics']['recall_mean_image']:.6f}`",
+            f"- Validation F1, pooled TP/FP/FN: `{stage2_winner['validation_metrics']['f1_pooled']:.6f}`",
+        ]
+    )
+    return lines
+
+
+def _write_model_config(
+    path: Path,
+    *,
+    cfg: dict[str, Any],
+    mode: str,
+    final_model_path: Path,
+    winner: pd.Series,
+    finalists: pd.DataFrame,
+    split_summary: dict[str, Any],
+    profile: dict[str, Any],
+    optimizer_plan_payload: dict[str, Any],
+    stage1_guardrails: dict[str, Any],
+    stage1_ranking: dict[str, Any],
+    stage1_shortlist_records: list[dict[str, Any]],
+) -> None:
+    recipe = dict(winner["recipe"])
+    payload = {
+        "schema": "mrsnappy_model_config_v1",
+        "purpose": "Complete record for the optimized SNAPpy model saved in model.joblib.",
+        "dataset_name": cfg["dataset_name"],
+        "optimization_mode": mode,
+        "validation_strategy": "fixed user-supplied train/ and val/ folders",
+        "model_path": str(final_model_path),
+        "output_files": {
+            "model": "model.joblib",
+            "model_config": "model_config.json",
+            "model_summary": "model_summary.md",
+            "optimization_splits": "optimization_splits.csv",
+        },
+        "effective_config": _json_ready(cfg),
+        "dataset_profile": _json_ready(profile),
+        "optimizer_plan": _json_ready(optimizer_plan_payload),
+        "optimization_split_summary": split_summary,
+        "stage1_recipe_id": str(winner.get("stage1_recipe_id", "")),
+        "stage2_recipe_id": str(winner["recipe_id"]),
+        "stage1_parameters": {
+            key: _json_ready(recipe.get(key))
+            for key in _STAGE1_SCREEN_FIELDS
+            if key in recipe
+        },
+        "stage2_parameters": _stage2_parameter_payload(recipe, winner),
+        "winner_scores": {
+            "stage1": _stage1_score_payload(winner),
+            "stage2_validation": _validation_metric_payload(winner),
+        },
+        "stage1_selection": {
+            "guardrails": stage1_guardrails,
+            "ranking": stage1_ranking,
+            "shortlisted_stage1_recipes": stage1_shortlist_records,
+        },
+        "selection": {
+            "stage2_f1_tolerance_config": _stage2_f1_tolerance(cfg),
+            "winner_stage2_f1_loss": float(winner.get("stage2_f1_loss", 0.0)),
+            "ranking_order": [
+                "keep recipes within stage2_f1_tolerance of the best mean per-image validation F1",
+                "prefer simpler feature pack",
+                "prefer simpler model and SVM hyperparameters",
+                "then prefer better Stage 1 rank",
+                "deterministic recipe_id",
+            ],
+            "finalists_within_stage2_f1_tolerance": _stage2_finalist_records(finalists, winner),
+        },
+        "full_recipe": _json_ready(recipe),
+    }
+    write_json(path, payload)
+
+
+def _write_terminal_model_outputs(
     run_dir: Path,
     *,
     cfg: dict[str, Any],
+    mode: str,
+    status: str,
+    message: str,
+    split_summary: dict[str, Any],
     profile: dict[str, Any],
-    preflight_df: pd.DataFrame,
-    shortlist: pd.DataFrame,
-    stage2_df: pd.DataFrame | None,
-    finalists: pd.DataFrame | None,
-    winner: pd.Series | None,
-    timings: dict[str, float],
-) -> None:
-    preflight_cfg = cfg["preflight"]
-    optimizer_cfg = cfg["optimizer"]
-    top_stage1_cols = [
-        "stage1_rank_passed",
-        "recipe_id",
-        "mean_stage1_recall",
-        "mean_stage1_precision",
-        "mean_stage1_candidates",
-        "mean_stage1_candidate_ratio",
-        "max_stage1_candidates",
-        "stage2_recipe_count",
-        "preflight_utility",
-        "stage1_decision",
-    ]
-    stage2_cols = [
-        "recipe_id",
-        "val_f1",
-        "val_precision",
-        "val_recall",
-        "selection_margin",
-        "preflight_utility",
-        "decision_threshold",
-    ]
-
-    winner_recipe: dict[str, Any] | None = None
-    if winner is not None and "recipe" in winner.index:
-        winner_recipe = _compact_recipe(dict(winner["recipe"]))
-
-    decision = {
-        "purpose": "Auditable SNAPpy optimizer decision record for Stage 1 screening and Stage 2 recipe selection.",
-        "dataset_name": cfg["dataset_name"],
-        "dataset_profile": profile,
-        "stage1_policy": {
-            "guardrails": {
-                "min_stage1_recall": float(preflight_cfg["min_stage1_recall"]),
-                "max_stage1_candidates_mean": float(preflight_cfg["max_stage1_candidates_mean"]),
-                "max_stage1_candidates_single": int(preflight_cfg["max_stage1_candidates_single"]),
-                "max_stage1_candidates_per_label_mean": _json_scalar(preflight_cfg.get("max_stage1_candidates_per_label_mean")),
-                "auto_candidate_ratio_cap_enabled": bool(preflight_cfg.get("auto_candidate_ratio_cap_enabled", True)),
-                "auto_candidate_ratio_caps": deepcopy(preflight_cfg.get("auto_candidate_ratio_caps", {})),
-                "auto_candidate_ratio_low_contrast_multiplier": float(preflight_cfg.get("auto_candidate_ratio_low_contrast_multiplier", 1.25)),
-                "auto_candidate_ratio_high_contrast_multiplier": float(preflight_cfg.get("auto_candidate_ratio_high_contrast_multiplier", 0.85)),
+    optimizer_plan_payload: dict[str, Any],
+    requested_preflight_image_count: int | str | None = None,
+    preflight_image_count: int = 0,
+    available_validation_image_count: int = 0,
+) -> Path:
+    model_summary_path = run_dir / "model_summary.md"
+    model_config_path = run_dir / "model_config.json"
+    stage1_guardrails = (
+        _stage1_guardrail_summary(
+            cfg,
+            requested_preflight_image_count=requested_preflight_image_count or 0,
+            preflight_image_count=preflight_image_count,
+            available_validation_image_count=available_validation_image_count,
+        )
+        if "preflight" in cfg
+        else {}
+    )
+    write_json(
+        model_config_path,
+        {
+            "schema": "mrsnappy_model_config_v1",
+            "purpose": "SNAPpy optimization terminal record. No usable model.joblib was produced.",
+            "status": status,
+            "message": message,
+            "dataset_name": cfg.get("dataset_name"),
+            "optimization_mode": mode,
+            "validation_strategy": "fixed user-supplied train/ and val/ folders",
+            "output_files": {
+                "model_config": "model_config.json",
+                "model_summary": "model_summary.md",
+                "optimization_splits": "optimization_splits.csv",
             },
-            "utility_formula": "recall + 0.05 * precision - 0.08 * log1p(mean_candidates / max(mean_labels, 1))",
-            "ranking_order": [
-                "higher preflight_utility",
-                "higher mean_stage1_recall",
-                "higher mean_stage1_precision",
-                "stage1 recipe id for deterministic ties",
-            ],
-            "shortlist_top_k": int(optimizer_cfg["shortlist_top_k"]),
-            "shortlist_unit": "Stage 1 candidate-generation configurations; all Stage 2 feature packs are retained for selected Stage 1 configurations.",
+            "effective_config": _json_ready(cfg),
+            "dataset_profile": _json_ready(profile),
+            "optimizer_plan": _json_ready(optimizer_plan_payload),
+            "optimization_split_summary": split_summary,
+            "stage1": {
+                "guardrails": stage1_guardrails,
+                "ranking": _stage1_ranking_summary(cfg) if "stage1_ranking" in cfg else {},
+            },
         },
-        "stage1_outcome": {
-            "recipes_evaluated": int(len(preflight_df)),
-            "recipes_passed": int(preflight_df["passed"].sum()) if not preflight_df.empty else 0,
-            "recipes_shortlisted_for_stage2": int(len(shortlist)),
-            "stage1_configs_shortlisted_for_stage2": int(shortlist["stage1_key"].nunique()) if "stage1_key" in shortlist else 0,
-            "failure_reason_counts": _failure_reason_counts(preflight_df),
-            "top_passed_recipes": _table_records(
-                preflight_df[preflight_df["passed"]].sort_values("stage1_rank_passed"),
-                top_stage1_cols,
-                limit=10,
-            ),
-        },
-        "stage2_policy": {
-            "stage2_recipes_from_stage1_shortlist": int(len(shortlist)),
-            "stage2_feature_packs": list(cfg.get("stage2_feature_packs", [])),
-            "svm_selection": "For each SVM hyperparameter setting, fit on train/ candidates, evaluate on all val/ images, tune threshold on val/, and select by validation metrics.",
-            "selection_margin": float(optimizer_cfg["selection_margin"]),
-            "winner_ranking_order": [
-                "within selection_margin of best validation F1",
-                "higher val_f1",
-                "higher preflight_utility",
-                "higher val_precision",
-                "higher mean_stage1_precision",
-            ],
-        },
-        "runtime_caching": {
-            "stage1_cache_enabled": bool(cfg.get("pipeline_defaults", {}).get("stage1_cache_enabled", cfg.get("stage1_cache_enabled", True))),
-            "stage1_cache_entries": int(cfg.get("pipeline_defaults", {}).get("stage1_cache_entries", cfg.get("stage1_cache_entries", 128))),
-            "preprocess_cache_entries": int(cfg.get("pipeline_defaults", {}).get("preprocess_cache_entries", 96)),
-            "fit_cache_enabled": bool(cfg.get("pipeline_defaults", {}).get("fit_cache_enabled", cfg.get("fit_cache_enabled", True))),
-            "fit_cache_entries": int(cfg.get("pipeline_defaults", {}).get("fit_cache_entries", cfg.get("fit_cache_entries", 512))),
-            "notes": "Stage 1 preflight evaluates each unique candidate-generation configuration once. Processed/smoothed 3D volumes are cached by image and processing parameters. Stage 1 candidate coordinates/scores are cached separately by image and detector parameters. Fitted candidate feature tables are cached by image, Stage 1 parameters, pruning limits, and fit settings so feature-pack and SVM sweeps do not refit identical candidates.",
-        },
-        "stage2_outcome": {
-            "stage2_recipes_evaluated": 0 if stage2_df is None else int(len(stage2_df)),
-            "finalists_within_margin": 0 if finalists is None else int(len(finalists)),
-            "stage2_results": [] if stage2_df is None else _table_records(stage2_df.sort_values("selection_margin"), stage2_cols, limit=10),
-            "winner_recipe_id": None if winner is None else str(winner["recipe_id"]),
-            "winner_recipe": winner_recipe,
-        },
-        "timings": {key: float(value) for key, value in timings.items()},
-        "artifacts": {
-            "stage1_recipes": "export_optimize_report/stage1_recipes.csv",
-            "per_image_stage1": "export_optimize_report/stage1_by_image.csv",
-            "stage1_summary": "export_optimize_report/stage1_summary.csv",
-            "stage2_recipes": "export_optimize_report/stage2_recipes.csv",
-            "stage2_summary": "export_optimize_report/stage2_summary.csv",
-            "machine_readable_decision_record": "export_optimize_report/selection_decision.json",
-            "human_readable_decision_record": "export_optimize_report/selection_decision.md",
-        },
-    }
-    write_json(run_dir / "selection_decision.json", decision)
-
-    fail_text = ", ".join(f"{count}x {reason}" for reason, count in list(decision["stage1_outcome"]["failure_reason_counts"].items())[:5])
-    if not fail_text:
-        fail_text = "none"
-    winner_text = decision["stage2_outcome"]["winner_recipe_id"] or "none"
-    ratio_cap = preflight_cfg.get("max_stage1_candidates_per_label_mean")
-    ratio_cap_text = "disabled" if ratio_cap is None else f"{float(ratio_cap):.2f}"
-    lines = [
-        "# SNAPpy Optimizer Decision Record",
-        "",
-        "## Stage 1 Policy",
-        f"- Guardrails: recall >= `{float(preflight_cfg['min_stage1_recall']):.4f}`, mean candidates <= `{float(preflight_cfg['max_stage1_candidates_mean']):.1f}`, single-image candidates <= `{int(preflight_cfg['max_stage1_candidates_single'])}`, candidate/label ratio <= `{ratio_cap_text}`.",
-        "- Utility: `recall + 0.05 * precision - 0.08 * log1p(candidate/label density)`.",
-        "- Ranking: utility, recall, precision, deterministic Stage 1 recipe id.",
-        "",
-        "## Stage 1 Outcome",
-        f"- Evaluated `{decision['stage1_outcome']['recipes_evaluated']}` recipes; `{decision['stage1_outcome']['recipes_passed']}` passed; `{decision['stage1_outcome']['stage1_configs_shortlisted_for_stage2']}` Stage 1 configurations expanded to `{decision['stage1_outcome']['recipes_shortlisted_for_stage2']}` Stage 2 recipes.",
-        f"- Main failure reasons: {fail_text}.",
-        "",
-        "## Stage 2 Outcome",
-        f"- SVM selection: {decision['stage2_policy']['svm_selection']}",
-        f"- Evaluated `{decision['stage2_outcome']['stage2_recipes_evaluated']}` shortlisted recipes; `{decision['stage2_outcome']['finalists_within_margin']}` were within the configured selection margin.",
-        f"- Winner: `{winner_text}`.",
-    ]
-    (run_dir / "selection_decision.md").write_text("\n".join(lines) + "\n")
+    )
+    model_summary_path.write_text(
+        "# SNAPpy Optimizer\n\n"
+        f"Status: `{status}`\n\n"
+        f"{message}\n\n"
+        "No `model.joblib` was produced.\n",
+    )
+    return model_summary_path
 
 
 def _safe_quantile(values: list[float], q: float) -> float:
@@ -617,19 +1430,11 @@ def _profile_dataset(cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _auto_candidate_ratio_cap(profile: dict[str, Any], preflight_cfg: dict[str, Any]) -> float:
-    density = str(profile.get("density_regime", "moderate"))
-    contrast = str(profile.get("contrast_regime", "moderate"))
-    base_caps = preflight_cfg.get(
-        "auto_candidate_ratio_caps",
-        {"sparse": 130.0, "moderate": 100.0, "dense": 70.0},
-    )
-    cap = float(base_caps.get(density, 100.0))
-    if contrast == "low":
-        cap *= float(preflight_cfg.get("auto_candidate_ratio_low_contrast_multiplier", 1.25))
-    elif contrast == "high":
-        cap *= float(preflight_cfg.get("auto_candidate_ratio_high_contrast_multiplier", 0.85))
-    return round(cap, 2)
+def _active_candidate_ratio_cap(preflight_cfg: dict[str, Any]) -> float | None:
+    ratio_cap = preflight_cfg.get("max_candidate_ratio_cap_mean")
+    if ratio_cap is None:
+        return None
+    return float(ratio_cap)
 
 
 def _append_unique_stage1(stage1_rows: list[dict[str, Any]], additions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -730,22 +1535,11 @@ def _augment_stage1_recipes(cfg: dict[str, Any], profile: dict[str, Any]) -> lis
 def _apply_profile_guidance(cfg: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
     guided = deepcopy(cfg)
     guided["dataset_profile"] = deepcopy(profile)
+
     if not profile.get("enabled", False):
         return guided
 
-    explicit_recipes = bool(guided.get("recipes"))
-    apply_to_explicit = bool(guided.get("profiling", {}).get("apply_to_explicit_recipes", False))
-    preflight_cfg = guided.get("preflight", {})
-    if (
-        bool(preflight_cfg.get("auto_candidate_ratio_cap_enabled", True))
-        and (not explicit_recipes or apply_to_explicit)
-        and preflight_cfg.get("max_stage1_candidates_per_label_mean") is None
-    ):
-        guided["preflight"]["max_stage1_candidates_per_label_mean"] = _auto_candidate_ratio_cap(
-            profile,
-            preflight_cfg,
-        )
-
+    explicit_recipes = str(guided.get("stage1_detector_set", "")).strip().lower() == "custom"
     if not explicit_recipes and bool(guided.get("profiling", {}).get("stage1_augmentation_enabled", False)):
         guided["stage1_recipes"] = _augment_stage1_recipes(guided, profile)
     return guided
@@ -768,7 +1562,6 @@ def _apply_runtime_recipe_guidance(
     full_fit_per_label = 20.0 if density == "sparse" else 16.0
     full_fit_unlabeled_per_label = 24.0 if density == "sparse" else 20.0
     full_fit_min = 384
-    negative_ratio = 24.0 if density == "sparse" else 32.0
 
     expected_labels = float(profile.get("label_count_mean", 0.0) or 0.0)
     out: list[dict[str, Any]] = []
@@ -792,90 +1585,26 @@ def _apply_runtime_recipe_guidance(
         )
         row["full_fit_labeled_min_candidates"] = int(row.get("full_fit_labeled_min_candidates", full_fit_min) or full_fit_min)
         row["fit_fallback_method"] = str(row.get("fit_fallback_method", "moments"))
-        row["negative_to_positive_ratio"] = float(row.get("negative_to_positive_ratio", negative_ratio) or negative_ratio)
         out.append(row)
     return out
-
-
-def _candidate_feature_rows_from_metas(
-    metas: list[dict[str, Any]],
-    *,
-    selected_features: list[str],
-    model: Any,
-    decision_threshold: float,
-    match_distance: float,
-) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for meta in metas:
-        image_id = Path(str(meta["image_path"])).stem
-        coords = np.asarray(meta["coords"], dtype=np.float32)
-        scores = np.asarray(meta["scores"], dtype=np.float32)
-        gt = np.asarray(meta["gt"], dtype=np.float32)
-        features = meta["features"].reset_index(drop=True)
-        labels = np.asarray(meta["labels"], dtype=np.int32)
-        _, svm_used = model_type_and_svm_flag(model)
-        if len(coords):
-            feature_matrix = features[selected_features].to_numpy(dtype=np.float32)
-            if hasattr(model, "decision_function"):
-                model_scores = np.asarray(model.decision_function(feature_matrix), dtype=np.float32)
-            else:
-                model_scores = np.asarray(model.predict(feature_matrix), dtype=np.float32)
-        else:
-            model_scores = np.empty((0,), dtype=np.float32)
-        _, nearest_dist, nearest_ids = _nearest_gt_columns(coords, gt, match_distance)
-        matched_ids: list[int | None] = []
-        matched_coords = np.full((len(coords), 3), np.nan, dtype=np.float32)
-        for idx in range(len(coords)):
-            nearest_id = nearest_ids[idx] if idx < len(nearest_ids) else None
-            distance = float(nearest_dist[idx]) if idx < len(nearest_dist) else np.nan
-            matched_id = nearest_id if nearest_id is not None and distance <= float(match_distance) else None
-            matched_ids.append(matched_id)
-            if matched_id is not None and len(gt):
-                matched_coords[idx] = gt[matched_id]
-        rows.extend(
-            candidate_feature_rows(
-                image_id=image_id,
-                coords=coords,
-                maxima_scores=scores,
-                features=features,
-                model_scores=model_scores,
-                decision_threshold=float(decision_threshold),
-                selected_features=selected_features,
-                svm_used=svm_used,
-                labels=labels,
-                matched_gt_ids=matched_ids,
-                matched_gt_coords=matched_coords,
-                nearest_gt_ids=nearest_ids,
-                nearest_gt_distances=nearest_dist,
-            )
-        )
-    return rows
 
 
 def _evaluate_stage2_recipe(
     recipe: dict[str, Any],
     cfg: dict[str, Any],
     run_dir: Path,
-    candidate_feature_cache: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     trial_dir = ensure_dir(run_dir / recipe["recipe_id"])
     model_path = trial_dir / "model.joblib"
+    match_kwargs = _match_distance_kwargs(cfg)
     trained = train_native_model(
         dataset_root=cfg["dataset_root"],
         recipe=recipe,
         svm_cfg=cfg["svm_sweep"],
         model_path=model_path,
-        match_distance=float(cfg["match_distance"]),
+        **match_kwargs,
     )
-    if candidate_feature_cache is not None:
-        candidate_feature_cache[recipe["recipe_id"]] = _candidate_feature_rows_from_metas(
-            trained.validation_metas or [],
-            selected_features=list(trained.selected_features),
-            model=trained.model,
-            decision_threshold=float(trained.decision_threshold),
-            match_distance=float(cfg["match_distance"]),
-        )
-    val_preds, val_gts, val_seconds = predict_split(
+    val_preds, val_gts = predict_split(
         dataset_root=cfg["dataset_root"],
         split="val",
         recipe=recipe,
@@ -883,11 +1612,10 @@ def _evaluate_stage2_recipe(
         output_root=trial_dir / "val_predictions",
         score_threshold=float(trained.decision_threshold),
     )
-    val_metrics = evaluate_predictions(val_preds, val_gts, float(cfg["match_distance"]))
+    val_metrics = evaluate_predictions_for_selection(val_preds, val_gts, **match_kwargs)
     result = {
         "recipe_id": recipe["recipe_id"],
         "model_path": str(model_path),
-        "val_runtime_seconds": val_seconds,
         "decision_threshold": float(trained.decision_threshold),
         **trained.best_params,
         **{f"val_{k}": v for k, v in val_metrics.items()},
@@ -897,208 +1625,115 @@ def _evaluate_stage2_recipe(
     return result
 
 
-def _write_report_exports(
-    run_dir: Path,
-    *,
-    cfg: dict[str, Any],
-    stage1_recipes: list[dict[str, Any]],
-    preflight_df: pd.DataFrame,
-    preflight_image_df: pd.DataFrame,
-    stage2_df: pd.DataFrame,
-    winner: pd.Series | None,
-) -> None:
-    report_dir = ensure_dir(run_dir / "export_optimize_report")
-    _write_stage1_recipes_csv(report_dir / "stage1_recipes.csv", stage1_recipes)
-    _write_stage2_recipes_csv(report_dir / "stage2_recipes.csv", stage2_df)
-
-    stage1_by_image = preflight_image_df.rename(
-        columns={
-            "recipe_id": "stage1_id",
-            "image": "image_id",
-            "n_candidates": "candidates_in_image",
-            "n_labels": "gt_in_image",
-        }
-    ).copy()
-    if not stage1_by_image.empty and not preflight_df.empty:
-        decision_cols = preflight_df[
-            ["recipe_id", "passed", "stage1_decision", "preflight_utility", "stage1_rank_passed", "shortlisted_for_stage2"]
-        ].rename(
-            columns={
-                "recipe_id": "stage1_id",
-                "passed": "guardrail_pass",
-                "stage1_decision": "guardrail_reason",
-                "preflight_utility": "preflight_score",
-            }
-        )
-        stage1_by_image = stage1_by_image.merge(decision_cols, on="stage1_id", how="left")
-    if "image_id" in stage1_by_image:
-        stage1_by_image["image_id"] = stage1_by_image["image_id"].astype(str).map(lambda text: Path(text).stem)
-    stage1_by_image.to_csv(report_dir / "stage1_by_image.csv", index=False)
-
-    stage1_summary = preflight_df.rename(
-        columns={
-            "recipe_id": "stage1_id",
-            "passed": "guardrail_pass",
-            "stage1_decision": "guardrail_reason",
-            "preflight_utility": "preflight_score",
-        }
-    ).copy()
-    if "recipe" in stage1_summary:
-        stage1_summary = stage1_summary.drop(columns=["recipe"])
-    stage1_summary.to_csv(report_dir / "stage1_summary.csv", index=False)
-
-    stage2_summary = stage2_df.copy()
-    if not stage2_summary.empty:
-        stage2_summary = stage2_summary.rename(columns={"recipe_id": "stage2_id", "stage1_recipe_id": "stage1_id"})
-        stage2_summary["winner"] = False
-        if winner is not None:
-            stage2_summary.loc[stage2_summary["stage2_id"].astype(str) == str(winner["recipe_id"]), "winner"] = True
-        if "recipe" in stage2_summary:
-            stage2_summary = stage2_summary.drop(columns=["recipe"])
-        if "model_path" in stage2_summary:
-            stage2_summary = stage2_summary.drop(columns=["model_path"])
-    stage2_summary.to_csv(report_dir / "stage2_summary.csv", index=False)
-
-    for name in ("selection_decision.json", "selection_decision.md"):
-        src = run_dir / name
-        if src.exists():
-            shutil.copy2(src, report_dir / name)
-
-
-def _nearest_gt_columns(coords: np.ndarray, gt: np.ndarray, match_distance: float) -> tuple[list[int | None], np.ndarray, list[int | None]]:
-    if len(coords) == 0:
-        return [], np.empty((0,), dtype=np.float32), []
-    if len(gt) == 0:
-        return [None] * len(coords), np.full((len(coords),), np.nan, dtype=np.float32), [None] * len(coords)
-    d = pairwise_distances(coords, gt)
-    nearest_idx = np.argmin(d, axis=1).astype(int)
-    nearest_dist = d[np.arange(len(coords)), nearest_idx].astype(np.float32)
-    matched_ids = [int(nearest_idx[idx]) if float(nearest_dist[idx]) <= float(match_distance) else None for idx in range(len(coords))]
-    return matched_ids, nearest_dist, nearest_idx.tolist()
-
-
-def _write_candidate_feature_export(
-    run_dir: Path,
-    *,
-    cfg: dict[str, Any],
-    winner: pd.Series,
-    candidate_rows: list[dict[str, Any]],
-) -> None:
-    feature_dir = ensure_dir(run_dir / "export_candidate_features")
-    recipe = dict(winner["recipe"])
-    selected_features = list(recipe.get("selected_features") or [])
-    winner_model_type = str(winner.get("model_type", "svm"))
-    svm_used = winner_model_type != "stage1_pass_through"
-    write_candidate_features_csv(
-        feature_dir / "val_candidates.csv",
-        candidate_rows,
-        columns=candidate_feature_columns(selected_features, include_labels=True, include_ground_truth=True),
-    )
-    write_candidate_features_manifest(
-        feature_dir / "candidate_features_manifest.json",
-        {
-            "split": "val",
-            "stage2_id": str(winner["recipe_id"]),
-            "stage1_id": str(winner.get("stage1_recipe_id", "")),
-            "feature_pack_name": recipe.get("feature_pack_name"),
-            "model_type": winner_model_type,
-            "svm_used": bool(svm_used),
-            "selected_features": selected_features,
-            "maxima_score_definition": "Detector response value at the candidate maximum before Gaussian fitting and SVM classification.",
-            "svm_score_definition": "Winning SVM decision_function score for the candidate feature vector when Stage 2 SVM classification is used; null for Stage 1 pass-through models.",
-            "model_score_definition": "Score used for the model acceptance decision. For Stage 2 SVM models this matches svm_score; for Stage 1 pass-through models it is the pass-through model score.",
-            "accepted_by_model_definition": "True when model_score is greater than the winning decision threshold.",
-            "match_distance": float(cfg["match_distance"]),
-            "feature_file": "val_candidates.csv",
-        },
-    )
-
-
-def _remove_optional_root_decision_files(run_dir: Path) -> None:
-    for name in ("selection_decision.json", "selection_decision.md"):
-        path = run_dir / name
-        if path.exists():
-            path.unlink()
-
-
 def optimize_native_dataset(
     config_path: str | Path,
     run_dir: str | Path,
-    *,
-    export_optimize_report: bool = False,
-    export_candidate_features: bool = False,
 ) -> Path:
     clear_pipeline_caches()
     cfg = load_config(config_path)
+    mode = _require_fixed_split_mode(cfg)
     run_dir = ensure_dir(run_dir)
-    timings: dict[str, float] = {}
+    split_summary = _write_optimization_split_records(run_dir, cfg)
     profile = _profile_dataset(cfg)
     cfg = _apply_profile_guidance(cfg, profile)
-    write_json(run_dir / "dataset_profile.json", profile)
-    explicit_recipes = bool(cfg.get("recipes"))
+    explicit_recipes = str(cfg.get("stage1_detector_set", "")).strip().lower() == "custom"
     stage1_recipes = stage1_recipe_bank(cfg)
     stage1_recipes = _apply_runtime_recipe_guidance(stage1_recipes, cfg, profile, explicit_recipes=explicit_recipes)
     plan = _optimizer_plan_from_materialized(cfg, profile, stage1_recipes)
-    write_json(run_dir / "optimizer_plan.json", plan)
     _enforce_optimizer_plan_safety(plan, cfg)
     progress_path = run_dir / "preflight_progress.jsonl"
     if progress_path.exists():
         progress_path.unlink()
+    all_val_pairs = split_pairs(cfg["dataset_root"], "val")
+    requested_preflight_images = cfg["preflight"]["stage1_n_val_images"]
+    if isinstance(requested_preflight_images, str) and requested_preflight_images.strip().lower() == "all":
+        requested_preflight_image_count: int | str = "all"
+        val_pairs = all_val_pairs
+    else:
+        requested_preflight_image_count = int(requested_preflight_images)
+        val_pairs = all_val_pairs[: min(requested_preflight_image_count, len(all_val_pairs))]
+    min_stage1_cache_entries = max(1, int(cfg["optimizer"]["shortlist_top_k"]) * max(len(all_val_pairs), len(val_pairs), 1))
+    current_stage1_cache_entries = int(cfg.get("pipeline_defaults", {}).get("stage1_cache_entries", 0))
+    if current_stage1_cache_entries < min_stage1_cache_entries:
+        cfg["pipeline_defaults"]["stage1_cache_entries"] = min_stage1_cache_entries
+        cfg["runtime_cache"]["stage1_cache_entries"] = min_stage1_cache_entries
+    current_image_volume_cache_entries = int(cfg.get("pipeline_defaults", {}).get("image_volume_cache_entries", 0))
+    if current_image_volume_cache_entries < min_stage1_cache_entries:
+        cfg["pipeline_defaults"]["image_volume_cache_entries"] = min_stage1_cache_entries
+        cfg["runtime_cache"]["image_volume_cache_entries"] = min_stage1_cache_entries
+    for recipe in stage1_recipes:
+        recipe["stage1_cache_entries"] = int(cfg["pipeline_defaults"]["stage1_cache_entries"])
+        recipe["image_volume_cache_entries"] = int(cfg["pipeline_defaults"]["image_volume_cache_entries"])
+    match_kwargs = _match_distance_kwargs(cfg)
     _append_jsonl(
         progress_path,
         {
             "event": "preflight_start",
-            "timestamp": time.time(),
+            "optimization_mode": mode,
             "stage1_recipe_count": int(len(stage1_recipes)),
-            "preflight_image_count": int(cfg["preflight"]["stage1_n_val_images"]),
+            "requested_preflight_image_count": requested_preflight_image_count,
+            "preflight_image_count": int(len(val_pairs)),
+            "available_validation_image_count": int(len(all_val_pairs)),
             "dataset_name": cfg["dataset_name"],
         },
     )
-
-    val_pairs = split_pairs(cfg["dataset_root"], "val")
-    val_pairs = val_pairs[: int(cfg["preflight"]["stage1_n_val_images"])]
     preflight_rows: list[dict[str, Any]] = []
-    preflight_image_rows: list[dict[str, Any]] = []
-    preflight_detection_cap = int(cfg["preflight"]["max_stage1_candidates_single"]) + 1
-    t0 = time.time()
+    max_stage1_candidates_single = cfg["preflight"].get("max_stage1_candidates_single")
+    preflight_candidate_cap = (
+        int(math.ceil(float(max_stage1_candidates_single)))
+        if max_stage1_candidates_single is not None
+        else None
+    )
     for recipe_index, recipe in enumerate(stage1_recipes, start=1):
-        recipe_t0 = time.time()
         preflight_recipe = deepcopy(recipe)
-        preflight_recipe["max_candidates"] = preflight_detection_cap
+        if preflight_candidate_cap is not None:
+            preflight_recipe["max_candidates"] = preflight_candidate_cap
+        preflight_cache_signature = stage1_cache_signature(preflight_recipe)
         image_rows: list[dict[str, Any]] = []
+        early_stop_reasons: list[str] = []
+        early_stop_progress: dict[str, Any] | None = None
         for image_path, label_path in val_pairs:
-            image_row = preflight_image(image_path, label_path, preflight_recipe, float(cfg["match_distance"]))
+            image_row = dict(preflight_image(image_path, label_path, preflight_recipe, **match_kwargs))
             image_rows.append(image_row)
-            preflight_image_rows.append(
-                {
-                    "recipe_id": recipe["recipe_id"],
-                    "image": Path(image_path).name,
-                    "label": Path(label_path).name,
-                    **image_row,
-                }
+            guardrail_progress = _stage1_guardrail_progress(
+                image_rows,
+                total_preflight_images=len(val_pairs),
+                preflight_cfg=cfg["preflight"],
             )
+            if not guardrail_progress["can_still_pass"]:
+                early_stop_reasons = list(guardrail_progress["definitive_failure_reasons"])
+                early_stop_progress = guardrail_progress
+                break
         mean_candidates = float(sum(row["n_candidates"] for row in image_rows) / max(len(image_rows), 1))
         mean_labels = float(sum(row["n_labels"] for row in image_rows) / max(len(image_rows), 1))
         mean_recall = float(sum(row["recall"] for row in image_rows) / max(len(image_rows), 1))
         mean_precision = float(sum(row["precision"] for row in image_rows) / max(len(image_rows), 1))
         mean_f1 = float(sum(row["f1"] for row in image_rows) / max(len(image_rows), 1))
         max_candidates = int(max((row["n_candidates"] for row in image_rows), default=0))
-        mean_candidate_ratio = float(mean_candidates / max(mean_labels, 1.0))
+        mean_candidate_ratio = _mean_per_image_candidate_ratio(image_rows)
         total_tp = int(sum(row["tp"] for row in image_rows))
         total_fp = int(sum(row["fp"] for row in image_rows))
         total_fn = int(sum(row["fn"] for row in image_rows))
-        failure_reasons = _stage1_failure_reasons(
-            mean_recall=mean_recall,
-            mean_candidates=mean_candidates,
-            max_candidates=max_candidates,
-            mean_candidate_ratio=mean_candidate_ratio,
-            preflight_cfg=cfg["preflight"],
-        )
+        stopped_early = bool(early_stop_reasons)
+        if stopped_early:
+            failure_reasons = early_stop_reasons
+        else:
+            failure_reasons = _stage1_failure_reasons(
+                mean_recall=mean_recall,
+                mean_candidates=mean_candidates,
+                max_candidates=max_candidates,
+                mean_candidate_ratio=mean_candidate_ratio,
+                preflight_cfg=cfg["preflight"],
+            )
         passed = not failure_reasons
+        processed_image_count = int(len(image_rows))
+        total_preflight_image_count = int(len(val_pairs))
+        early_stop_reason = _preflight_pass_label(early_stop_reasons) if stopped_early else None
         preflight_rows.append(
             {
                 "recipe_id": recipe["recipe_id"],
                 "stage1_key": _stage1_screen_key(recipe),
+                "stage1_preflight_cache_signature": preflight_cache_signature,
                 "stage2_recipe_count": len(stage2_recipe_bank(cfg, [recipe])),
                 "mean_stage1_recall": mean_recall,
                 "mean_stage1_precision": mean_precision,
@@ -1110,94 +1745,101 @@ def optimize_native_dataset(
                 "mean_stage1_label_count": mean_labels,
                 "mean_stage1_candidate_ratio": mean_candidate_ratio,
                 "max_stage1_candidates": max_candidates,
-                "preflight_utility": _preflight_utility(mean_recall, mean_precision, mean_candidates, mean_labels),
-                "processing_cost_rank": _processing_cost_rank(recipe),
-                "fit_cost_rank": _fit_cost_rank(recipe),
-                "feature_count": len(recipe.get("selected_features") or []),
                 "passed": passed,
                 "stage1_decision": _preflight_pass_label(failure_reasons),
+                "stage1_stopped_early": stopped_early,
+                "stage1_early_stop_reason": early_stop_reason,
+                "stage1_preflight_images_processed": processed_image_count,
+                "stage1_preflight_images_total": total_preflight_image_count,
+                "stage1_maximum_possible_mean_recall": (
+                    early_stop_progress["maximum_possible_mean_recall"] if early_stop_progress else None
+                ),
+                "stage1_minimum_possible_mean_candidates": (
+                    early_stop_progress["minimum_possible_mean_candidates"] if early_stop_progress else None
+                ),
+                "stage1_minimum_possible_candidate_ratio": (
+                    early_stop_progress["minimum_possible_candidate_ratio"] if early_stop_progress else None
+                ),
                 "recipe": deepcopy(recipe),
             }
         )
+        pruned_stage1_cache_entries = _prune_stage1_cache_to_leaderboard(preflight_rows, cfg, val_pairs)
         _append_jsonl(
             progress_path,
             {
                 "event": "preflight_recipe_complete",
-                "timestamp": time.time(),
                 "recipe_index": int(recipe_index),
                 "stage1_recipe_count": int(len(stage1_recipes)),
                 "recipe_id": str(recipe["recipe_id"]),
-                "elapsed_total_seconds": float(time.time() - t0),
-                "elapsed_recipe_seconds": float(time.time() - recipe_t0),
                 "mean_stage1_recall": mean_recall,
                 "mean_stage1_precision": mean_precision,
                 "mean_stage1_candidates": mean_candidates,
                 "max_stage1_candidates": max_candidates,
                 "passed": passed,
                 "stage1_decision": _preflight_pass_label(failure_reasons),
+                "stage1_stopped_early": stopped_early,
+                "stage1_early_stop_reason": early_stop_reason,
+                "stage1_preflight_images_processed": processed_image_count,
+                "stage1_preflight_images_total": total_preflight_image_count,
+                "stage1_candidate_cache_pruned_entries": int(pruned_stage1_cache_entries),
             },
         )
-    timings["preflight_seconds"] = time.time() - t0
     _append_jsonl(
         progress_path,
         {
             "event": "preflight_complete",
-            "timestamp": time.time(),
-            "elapsed_total_seconds": float(timings["preflight_seconds"]),
             "stage1_recipe_count": int(len(stage1_recipes)),
         },
     )
     preflight_df = pd.DataFrame(preflight_rows)
-    preflight_image_df = pd.DataFrame(preflight_image_rows)
 
     passed_df = preflight_df[preflight_df["passed"]].copy()
     if passed_df.empty:
-        preflight_df = _apply_preflight_decision_columns(preflight_df)
-        _write_selection_decision_record(
+        preflight_df = _apply_preflight_decision_columns(preflight_df, ranking_cfg=cfg["stage1_ranking"])
+        summary_path = _write_terminal_model_outputs(
             run_dir,
             cfg=cfg,
+            mode=mode,
+            status="no_preflight_survivors",
+            message="No recipes passed Stage 1 preflight.",
+            split_summary=split_summary,
             profile=profile,
-            preflight_df=preflight_df,
-            shortlist=pd.DataFrame(),
-            stage2_df=None,
-            finalists=None,
-            winner=None,
-            timings=timings,
+            optimizer_plan_payload=plan,
+            requested_preflight_image_count=requested_preflight_image_count,
+            preflight_image_count=len(val_pairs),
+            available_validation_image_count=len(all_val_pairs),
         )
-        summary = {
-            "dataset_name": cfg["dataset_name"],
-            "status": "no_preflight_survivors",
-            "timings": timings,
-        }
-        write_json(run_dir / "summary.json", summary)
-        (run_dir / "summary.md").write_text(
-            "# SNAPpy Native Optimizer\n\nNo recipes passed preflight.\n",
-        )
-        if export_optimize_report:
-            _write_report_exports(
-                run_dir,
-                cfg=cfg,
-                stage1_recipes=stage1_recipes,
-                preflight_df=preflight_df,
-                preflight_image_df=preflight_image_df,
-                stage2_df=pd.DataFrame(),
-                winner=None,
-            )
-        _remove_optional_root_decision_files(run_dir)
-        return run_dir / "summary.md"
+        _remove_optimizer_progress_files(run_dir)
+        return summary_path
 
     shortlist, selected_stage1_keys = _stage2_shortlist_from_passed(
         passed_df,
         top_k=int(cfg["optimizer"]["shortlist_top_k"]),
+        ranking_cfg=cfg["stage1_ranking"],
     )
     preflight_df = _apply_preflight_decision_columns(
         preflight_df,
         shortlist_ids=set(shortlist["recipe_id"].astype(str)),
         stage2_ids=set(shortlist["recipe_id"].astype(str)),
+        ranking_cfg=cfg["stage1_ranking"],
     )
     preflight_df["stage1_selected_for_stage2"] = preflight_df["stage1_key"].astype(str).isin(set(selected_stage1_keys))
     stage1_shortlist = preflight_df[preflight_df["shortlisted_for_stage2"]].copy()
     stage1_shortlist = stage1_shortlist.sort_values("stage1_rank_passed")
+    _prune_stage1_cache_to_leaderboard(preflight_rows, cfg, val_pairs)
+    promoted_stage1_cache_entries = _promote_shortlisted_stage1_caches(
+        stage1_shortlist,
+        preflight_candidate_cap=preflight_candidate_cap,
+        val_pairs=val_pairs,
+    )
+    full_val_stage1_df = _evaluate_full_val_stage1(stage1_shortlist, cfg, all_val_pairs)
+    if not full_val_stage1_df.empty:
+        full_val_columns = ["recipe_id"] + [col for col in full_val_stage1_df.columns if col.startswith("stage1_full_val_")]
+        preflight_df = preflight_df.merge(full_val_stage1_df[full_val_columns], on="recipe_id", how="left")
+        stage1_shortlist = preflight_df[preflight_df["shortlisted_for_stage2"]].copy()
+        stage1_shortlist = stage1_shortlist.sort_values("stage1_rank_passed")
+    promoted_full_val_image_volume_entries = _promote_shortlisted_stage1_image_volumes(stage1_shortlist, val_pairs=all_val_pairs)
+    stage1_shortlist = _annotate_stage1_train_label_status(stage1_shortlist, cfg)
     shortlist = _expand_stage2_shortlist(stage1_shortlist, cfg)
 
     stage2_progress_path = run_dir / "stage2_progress.jsonl"
@@ -1207,23 +1849,21 @@ def optimize_native_dataset(
         stage2_progress_path,
         {
             "event": "stage2_start",
-            "timestamp": time.time(),
             "stage2_recipe_count": int(len(shortlist)),
             "shortlisted_stage1_count": int(stage1_shortlist["stage1_key"].nunique()) if "stage1_key" in stage1_shortlist else 0,
+            "promoted_stage1_candidate_cache_entries": int(promoted_stage1_cache_entries["candidate_entries"]),
+            "promoted_preflight_image_volume_cache_entries": int(promoted_stage1_cache_entries["image_volume_entries"]),
+            "promoted_full_val_image_volume_cache_entries": int(promoted_full_val_image_volume_entries),
         },
     )
 
-    candidate_feature_cache: dict[str, list[dict[str, Any]]] | None = {} if export_candidate_features else None
-    t0 = time.time()
     stage2_rows = []
     for stage2_index, (_, row) in enumerate(shortlist.iterrows(), start=1):
-        recipe_t0 = time.time()
         recipe = row["recipe"]
         _append_jsonl(
             stage2_progress_path,
             {
                 "event": "stage2_recipe_start",
-                "timestamp": time.time(),
                 "stage2_index": int(stage2_index),
                 "stage2_recipe_count": int(len(shortlist)),
                 "recipe_id": str(recipe["recipe_id"]),
@@ -1232,7 +1872,7 @@ def optimize_native_dataset(
             },
         )
         try:
-            result = _evaluate_stage2_recipe(recipe, cfg, run_dir / "stage2", candidate_feature_cache=candidate_feature_cache)
+            result = _evaluate_stage2_recipe(recipe, cfg, run_dir / "stage2")
         except ValueError as exc:
             message = str(exc)
             no_training_candidates = "generated no training candidates" in message
@@ -1257,13 +1897,18 @@ def optimize_native_dataset(
                 "val_f1": 0.0,
                 "val_precision": 0.0,
                 "val_recall": 0.0,
+                "val_f1_mean_image": 0.0,
+                "val_precision_mean_image": 0.0,
+                "val_recall_mean_image": 0.0,
+                "val_f1_pooled": 0.0,
+                "val_precision_pooled": 0.0,
+                "val_recall_pooled": 0.0,
                 "recipe": deepcopy(recipe),
             }
             _append_jsonl(
                 stage2_progress_path,
                 {
                     "event": "stage2_recipe_skipped",
-                    "timestamp": time.time(),
                     "stage2_index": int(stage2_index),
                     "stage2_recipe_count": int(len(shortlist)),
                     "recipe_id": str(recipe["recipe_id"]),
@@ -1276,24 +1921,19 @@ def optimize_native_dataset(
             stage2_progress_path,
             {
                 "event": "stage2_recipe_complete",
-                "timestamp": time.time(),
                 "stage2_index": int(stage2_index),
                 "stage2_recipe_count": int(len(shortlist)),
                 "recipe_id": str(recipe["recipe_id"]),
-                "elapsed_total_seconds": float(time.time() - t0),
-                "elapsed_recipe_seconds": float(time.time() - recipe_t0),
                 "val_f1": float(result.get("val_f1", 0.0)),
                 "val_precision": float(result.get("val_precision", 0.0)),
                 "val_recall": float(result.get("val_recall", 0.0)),
+                "val_f1_pooled": float(result.get("val_f1_pooled", 0.0)),
             },
         )
-    timings["stage2_seconds"] = time.time() - t0
     _append_jsonl(
         stage2_progress_path,
         {
             "event": "stage2_complete",
-            "timestamp": time.time(),
-            "elapsed_total_seconds": float(timings["stage2_seconds"]),
             "stage2_recipe_count": int(len(stage2_rows)),
         },
     )
@@ -1308,157 +1948,78 @@ def optimize_native_dataset(
     else:
         valid_stage2_df = stage2_df.copy()
     if valid_stage2_df.empty:
-        timings["stage2_seconds"] = time.time() - t0
         status_values = set(str(x) for x in stage2_df.get("stage2_status", pd.Series(dtype=str)).dropna().unique())
         terminal_status = (
             "no_true_positive_stage1_candidates"
             if status_values == {"skipped_no_true_positive_training_candidates"}
             else "no_valid_stage2_recipes"
         )
-        summary = {
-            "dataset_name": cfg["dataset_name"],
-            "status": terminal_status,
-            "timings": timings,
-        }
-        write_json(run_dir / "summary.json", summary)
-        (run_dir / "summary.md").write_text(
-            "# SNAPpy Native Optimizer\n\n"
-            "No valid Stage 2 recipes were trainable because the shortlisted Stage 1 recipes "
-            "did not provide two-class training labels.\n"
-        )
-        if export_optimize_report:
-            _write_report_exports(
-                run_dir,
-                cfg=cfg,
-                stage1_recipes=stage1_recipes,
-                preflight_df=preflight_df,
-                preflight_image_df=preflight_image_df,
-                stage2_df=stage2_df,
-                winner=None,
-            )
-        return run_dir / "summary.md"
-    stage2_df = valid_stage2_df
-    stage2_df["selection_margin"] = float(stage2_df["val_f1"].max()) - stage2_df["val_f1"]
-    finalists = stage2_df[stage2_df["selection_margin"] <= float(cfg["optimizer"]["selection_margin"])].copy()
-    if finalists.empty:
-        finalists = stage2_df.copy()
-    finalists = finalists.sort_values(_FINALIST_SORT_COLUMNS, ascending=False)
-    winner = finalists.iloc[0]
-
-    t0 = time.time()
-    final_model_path = run_dir / "model.joblib"
-    shutil.copy2(Path(str(winner["model_path"])), final_model_path)
-    timings["final_seconds"] = time.time() - t0
-
-    summary = {
-        "dataset_name": cfg["dataset_name"],
-        "dataset_profile": profile,
-        "winner": winner["recipe_id"],
-        "model_path": str(final_model_path),
-        "winner_recipe": winner["recipe"],
-        "val_f1": float(winner["val_f1"]),
-        "decision_threshold": float(winner.get("decision_threshold", 0.0)),
-        "timings": timings,
-    }
-    write_json(run_dir / "summary.json", summary)
-    _write_selection_decision_record(
-        run_dir,
-        cfg=cfg,
-        profile=profile,
-        preflight_df=preflight_df,
-        shortlist=shortlist,
-        stage2_df=stage2_df,
-        finalists=finalists,
-        winner=winner,
-        timings=timings,
-    )
-
-    lines = [
-        "# SNAPpy Native Optimizer",
-        "",
-        f"- Dataset: `{cfg['dataset_name']}`",
-        f"- Density regime: `{profile.get('density_regime', 'unknown')}`",
-        f"- Contrast regime: `{profile.get('contrast_regime', 'unknown')}`",
-        f"- Background regime: `{profile.get('background_regime', 'unknown')}`",
-        f"- Winner: `{winner['recipe_id']}`",
-        f"- Winner model: `{final_model_path}`",
-        f"- Validation F1: `{float(winner['val_f1']):.6f}`",
-        f"- Decision threshold: `{float(winner.get('decision_threshold', 0.0)):.6f}`",
-        "",
-        "## Timing",
-        "",
-        f"- Preflight wall time: `{timings['preflight_seconds']:.2f} s`",
-        f"- Stage 2 wall time: `{timings['stage2_seconds']:.2f} s`",
-        f"- Final wall time: `{timings['final_seconds']:.2f} s`",
-    ]
-    if export_optimize_report:
-        lines.extend(
-            [
-                "",
-                "## Report",
-                "",
-                "- Stage 1 recipes: `export_optimize_report/stage1_recipes.csv`",
-                "- Stage 1 per-image metrics: `export_optimize_report/stage1_by_image.csv`",
-                "- Stage 1 selection summary: `export_optimize_report/stage1_summary.csv`",
-                "- Stage 2 recipes: `export_optimize_report/stage2_recipes.csv`",
-                "- Stage 2 validation summary: `export_optimize_report/stage2_summary.csv`",
-                "- Full optimizer rationale: `export_optimize_report/selection_decision.md` and `export_optimize_report/selection_decision.json`",
-            ]
-        )
-    if export_candidate_features:
-        lines.extend(
-            [
-                "",
-                "## Candidate Features",
-                "",
-                "- Winning validation candidate features: `export_candidate_features/val_candidates.csv`",
-                "- Candidate features manifest: `export_candidate_features/candidate_features_manifest.json`",
-            ]
-        )
-    (run_dir / "summary.md").write_text("\n".join(lines) + "\n")
-    write_json(
-        run_dir / "model_manifest.json",
-        {
-            "dataset_name": cfg["dataset_name"],
-            "model_path": str(final_model_path),
-            "stage2_id": str(winner["recipe_id"]),
-            "stage1_id": str(winner.get("stage1_recipe_id", "")),
-            "feature_pack_name": dict(winner["recipe"]).get("feature_pack_name"),
-            "selected_features": list(dict(winner["recipe"]).get("selected_features") or []),
-            "fit_method": dict(winner["recipe"]).get("fit_method"),
-            "fit_window": dict(winner["recipe"]).get("fit_window"),
-            "svm_params": {
-                "kernel": _json_scalar(winner.get("kernel")),
-                "C": _json_scalar(winner.get("C")),
-                "gamma": _json_scalar(winner.get("gamma")),
-                "degree": _json_scalar(winner.get("degree")),
-                "standardize": _json_scalar(winner.get("standardize")),
-                "class_weight_mode": _json_scalar(winner.get("class_weight_mode")),
-            },
-            "decision_threshold": float(winner.get("decision_threshold", 0.0)),
-            "validation_metrics": {
-                "tp": int(winner.get("val_tp", 0)),
-                "fp": int(winner.get("val_fp", 0)),
-                "fn": int(winner.get("val_fn", 0)),
-                "precision": float(winner.get("val_precision", 0.0)),
-                "recall": float(winner.get("val_recall", 0.0)),
-                "f1": float(winner.get("val_f1", 0.0)),
-            },
-        },
-    )
-    if export_optimize_report:
-        _write_report_exports(
+        summary_path = _write_terminal_model_outputs(
             run_dir,
             cfg=cfg,
-            stage1_recipes=stage1_recipes,
-            preflight_df=preflight_df,
-            preflight_image_df=preflight_image_df,
-            stage2_df=stage2_df,
-            winner=winner,
+            mode=mode,
+            status=terminal_status,
+            message=(
+                "No valid Stage 2 recipes were trainable because the shortlisted Stage 1 recipes "
+                "did not provide two-class training labels."
+            ),
+            split_summary=split_summary,
+            profile=profile,
+            optimizer_plan_payload=plan,
+            requested_preflight_image_count=requested_preflight_image_count,
+            preflight_image_count=len(val_pairs),
+            available_validation_image_count=len(all_val_pairs),
         )
-    _remove_optional_root_decision_files(run_dir)
-    if export_candidate_features:
-        candidate_rows = (candidate_feature_cache or {}).get(str(winner["recipe_id"]), [])
-        _write_candidate_feature_export(run_dir, cfg=cfg, winner=winner, candidate_rows=candidate_rows)
+        shutil.rmtree(run_dir / "stage2", ignore_errors=True)
+        _remove_optimizer_progress_files(run_dir)
+        return summary_path
+    stage2_df = _add_stage2_selection_columns(valid_stage2_df)
+    tolerance = _stage2_f1_tolerance(cfg)
+    finalists = stage2_df[stage2_df["stage2_f1_loss"] <= tolerance].copy()
+    if finalists.empty:
+        finalists = stage2_df.copy()
+    finalists = finalists.sort_values(_FINALIST_SORT_COLUMNS, ascending=_FINALIST_SORT_ASCENDING)
+    winner = finalists.iloc[0]
+
+    final_model_path = run_dir / "model.joblib"
+    shutil.copy2(Path(str(winner["model_path"])), final_model_path)
+    stage1_guardrails = _stage1_guardrail_summary(
+        cfg,
+        requested_preflight_image_count=requested_preflight_image_count,
+        preflight_image_count=len(val_pairs),
+        available_validation_image_count=len(all_val_pairs),
+    )
+    stage1_ranking = _stage1_ranking_summary(cfg)
+    stage1_shortlist_summary = _stage1_shortlist_records(stage1_shortlist)
+    stage2_winner = _stage2_winner_record(winner)
+
+    lines = _summary_markdown_lines(
+        cfg=cfg,
+        mode=mode,
+        split_summary=split_summary,
+        profile=profile,
+        final_model_path=final_model_path,
+        stage1_guardrails=stage1_guardrails,
+        stage1_ranking=stage1_ranking,
+        stage1_shortlist_records=stage1_shortlist_summary,
+        stage2_winner=stage2_winner,
+    )
+    model_summary_path = run_dir / "model_summary.md"
+    model_summary_path.write_text("\n".join(lines) + "\n")
+    _write_model_config(
+        run_dir / "model_config.json",
+        cfg=cfg,
+        mode=mode,
+        final_model_path=final_model_path,
+        winner=winner,
+        finalists=finalists,
+        split_summary=split_summary,
+        profile=profile,
+        optimizer_plan_payload=plan,
+        stage1_guardrails=stage1_guardrails,
+        stage1_ranking=stage1_ranking,
+        stage1_shortlist_records=stage1_shortlist_summary,
+    )
     shutil.rmtree(run_dir / "stage2", ignore_errors=True)
-    return run_dir / "summary.md"
+    _remove_optimizer_progress_files(run_dir)
+    return model_summary_path

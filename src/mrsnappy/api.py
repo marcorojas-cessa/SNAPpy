@@ -2,19 +2,14 @@ from __future__ import annotations
 
 import json
 import shutil
+import tempfile
 from importlib import resources
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import yaml
 
-from .candidate_features import (
-    candidate_feature_columns,
-    candidate_feature_rows,
-    model_type_and_svm_flag,
-    write_candidate_features_csv,
-    write_candidate_features_manifest,
-)
 from .config import load_config, load_text_config
 from .model import load_model
 from .optimizer import optimize_native_dataset, optimizer_plan
@@ -42,11 +37,11 @@ def init_config(output: str | Path) -> Path:
     return output
 
 
-def _write_effective_config(payload: dict[str, Any], run_dir: Path) -> Path:
-    run_dir.mkdir(parents=True, exist_ok=True)
-    path = run_dir / "effective_config.yaml"
-    path.write_text(yaml.safe_dump(payload, sort_keys=False))
-    return path
+def _write_temp_effective_config(payload: dict[str, Any]) -> Path:
+    handle = tempfile.NamedTemporaryFile("w", suffix=".mrsnappy_optimize.yaml", delete=False)
+    with handle:
+        handle.write(yaml.safe_dump(payload, sort_keys=False))
+    return Path(handle.name)
 
 
 def _resolve_out_dir(out_dir: str | Path | None) -> Path:
@@ -59,77 +54,62 @@ def _prepare_optimize_config(
     *,
     config: str | Path = DEFAULT_OPTIMIZE_CONFIG,
     out_dir: str | Path | None = None,
-    train_dir: str | Path | None = None,
+    dataset_root: str | Path | None = None,
     dataset_name: str | None = None,
-    match_distance: float | None = None,
 ) -> Path:
-    output_dir = _resolve_out_dir(out_dir)
     payload = _load_optimize_template(config)
-    if train_dir is not None:
-        payload["dataset_root"] = str(Path(train_dir).resolve())
+    if dataset_root is not None:
+        payload["dataset_root"] = str(Path(dataset_root).resolve())
     if dataset_name is not None:
         payload["dataset_name"] = dataset_name
-    if match_distance is not None:
-        payload["match_distance"] = float(match_distance)
     if not payload.get("dataset_root"):
-        raise ValueError("SNAPpy optimization requires dataset_root in the config or --train-dir.")
-    return _write_effective_config(payload, output_dir)
-
-
-def _resolve_export_flag(value: bool | None, payload: dict[str, Any], key: str) -> bool:
-    if value is not None:
-        return bool(value)
-    return bool(payload.get("exports", {}).get(key, False))
+        raise ValueError("SNAPpy optimization requires dataset_root in the config or --dataset-root.")
+    return _write_temp_effective_config(payload)
 
 
 def optimize(
     *,
     config: str | Path = DEFAULT_OPTIMIZE_CONFIG,
     out_dir: str | Path | None = None,
-    train_dir: str | Path | None = None,
+    dataset_root: str | Path | None = None,
     dataset_name: str | None = None,
-    match_distance: float | None = None,
-    export_optimize_report: bool | None = None,
-    export_candidate_features: bool | None = None,
 ) -> Path:
     output_dir = _resolve_out_dir(out_dir)
     effective_config = _prepare_optimize_config(
         config=config,
         out_dir=output_dir,
-        train_dir=train_dir,
+        dataset_root=dataset_root,
         dataset_name=dataset_name,
-        match_distance=match_distance,
     )
-    payload = load_text_config(effective_config)
-    return optimize_native_dataset(
-        effective_config,
-        output_dir,
-        export_optimize_report=_resolve_export_flag(export_optimize_report, payload, "export_optimize_report"),
-        export_candidate_features=_resolve_export_flag(export_candidate_features, payload, "export_candidate_features"),
-    )
+    try:
+        return optimize_native_dataset(effective_config, output_dir)
+    finally:
+        Path(effective_config).unlink(missing_ok=True)
 
 
 def optimize_dry_run(
     *,
     config: str | Path = DEFAULT_OPTIMIZE_CONFIG,
     out_dir: str | Path | None = None,
-    train_dir: str | Path | None = None,
+    dataset_root: str | Path | None = None,
     dataset_name: str | None = None,
-    match_distance: float | None = None,
 ) -> dict[str, Any]:
     output_dir = _resolve_out_dir(out_dir)
     effective_config = _prepare_optimize_config(
         config=config,
         out_dir=output_dir,
-        train_dir=train_dir,
+        dataset_root=dataset_root,
         dataset_name=dataset_name,
-        match_distance=match_distance,
     )
-    plan = optimizer_plan(effective_config)
-    plan_path = output_dir / "optimizer_plan.dry_run.json"
-    plan_path.write_text(json.dumps(plan, indent=2))
-    plan["plan_path"] = str(plan_path)
-    return plan
+    try:
+        plan = optimizer_plan(effective_config)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        plan_path = output_dir / "optimizer_plan.dry_run.json"
+        plan_path.write_text(json.dumps(plan, indent=2))
+        plan["plan_path"] = str(plan_path)
+        return plan
+    finally:
+        Path(effective_config).unlink(missing_ok=True)
 
 
 def _resolve_model(model: str | Path) -> tuple[Path, dict[str, Any] | None, float | None]:
@@ -151,15 +131,7 @@ def _iter_images(input_path: str | Path | None, input_list: str | Path | None) -
     return [path]
 
 
-def _candidate_features_root(output_path: Path, multi_image: bool) -> Path:
-    if multi_image or output_path.is_dir():
-        return output_path / "export_candidate_features"
-    return output_path.parent / "export_candidate_features"
-
-
 def _write_detections_csv(path: Path, coords: Any, scores: Any) -> Path:
-    import pandas as pd
-
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
         {
@@ -179,7 +151,7 @@ def _score_candidates_for_image(
     recipe: dict[str, Any],
     trained: Any,
     score_threshold: float,
-) -> tuple[Any, Any, Any, Any, Any]:
+) -> tuple[Any, Any, Any]:
     coords, maxima_scores, features = detect_image(image, recipe)
     selected_features = list(trained.selected_features)
     if len(coords) == 0:
@@ -193,65 +165,7 @@ def _score_candidates_for_image(
             model_scores = model.predict(matrix)
         model_scores = model_scores.astype("float32", copy=False)
     accepted = model_scores > float(score_threshold)
-    return coords, maxima_scores, features, model_scores, accepted
-
-
-def _write_detection_candidate_features(
-    *,
-    path: Path,
-    image: Path,
-    coords: Any,
-    maxima_scores: Any,
-    features: Any,
-    model_scores: Any,
-    trained: Any,
-    score_threshold: float,
-) -> Path:
-    selected_features = list(trained.selected_features)
-    _, svm_used = model_type_and_svm_flag(trained.model)
-    rows = candidate_feature_rows(
-        image_id=image.stem,
-        coords=coords,
-        maxima_scores=maxima_scores,
-        features=features,
-        model_scores=model_scores,
-        decision_threshold=float(score_threshold),
-        selected_features=selected_features,
-        svm_used=svm_used,
-    )
-    return write_candidate_features_csv(path, rows, columns=candidate_feature_columns(selected_features))
-
-
-def _write_detection_candidate_features_manifest(
-    *,
-    features_root: Path,
-    model: str | Path,
-    model_path: Path,
-    trained: Any,
-    score_threshold: float,
-    feature_files: list[Path],
-) -> Path:
-    model_type, svm_used = model_type_and_svm_flag(trained.model)
-    manifest_path = features_root / "candidate_features_manifest.json"
-    return write_candidate_features_manifest(
-        manifest_path,
-        {
-            "purpose": "Candidate-level SNAPpy detection feature export for the model recipe applied to unlabeled input images.",
-            "model": str(model),
-            "model_path": str(model_path),
-            "model_type": model_type,
-            "svm_used": bool(svm_used),
-            "selected_features": list(trained.selected_features),
-            "decision_threshold": float(score_threshold),
-            "coordinate_columns": "x,y,z are subpixel voxel coordinates; z is the stack axis.",
-            "maxima_score_definition": "Detector response value at the candidate maximum before Gaussian fitting and model scoring.",
-            "svm_score_definition": "SVM decision_function score when the model uses Stage 2 SVM classification; null for Stage 1 pass-through models.",
-            "model_score_definition": "Score used for the model acceptance decision. For Stage 2 SVM models this matches svm_score; for Stage 1 pass-through models it is the pass-through model score.",
-            "accepted_by_model_definition": "True when model_score is greater than decision_threshold.",
-            "accepted_detection_id_definition": "For accepted candidates, this equals the detection_id written in the corresponding detection CSV; null for rejected candidates.",
-            "feature_files": [str(path.relative_to(features_root)) for path in feature_files],
-        },
-    )
+    return coords, model_scores, accepted
 
 
 def detect(
@@ -262,7 +176,6 @@ def detect(
     output: str | Path | None = None,
     config: str | Path | None = None,
     score_threshold: float | None = None,
-    export_candidate_features: bool = False,
 ) -> dict[str, list[Path]]:
     model_path, model_recipe, model_threshold = _resolve_model(model)
     trained = load_model(model_path)
@@ -287,10 +200,8 @@ def detect(
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
     detection_outputs: list[Path] = []
-    candidate_feature_outputs: list[Path] = []
-    features_root = _candidate_features_root(output_path, multi_image) if export_candidate_features else None
     for image in images:
-        coords, maxima_scores, features, model_scores, accepted = _score_candidates_for_image(
+        coords, model_scores, accepted = _score_candidates_for_image(
             image=image,
             recipe=recipe,
             trained=trained,
@@ -301,29 +212,4 @@ def detect(
         out_file = output_path / f"{image.stem}.csv" if multi_image or output_path.is_dir() else output_path
         _write_detections_csv(out_file, kept_coords, kept_scores)
         detection_outputs.append(out_file)
-        if features_root is not None:
-            feature_file = features_root / f"{image.stem}_candidate_features.csv"
-            candidate_feature_outputs.append(
-                _write_detection_candidate_features(
-                    path=feature_file,
-                    image=image,
-                    coords=coords,
-                    maxima_scores=maxima_scores,
-                    features=features,
-                    model_scores=model_scores,
-                    trained=trained,
-                    score_threshold=float(score_threshold),
-                )
-            )
-    if features_root is not None:
-        candidate_feature_outputs.append(
-            _write_detection_candidate_features_manifest(
-                features_root=features_root,
-                model=model,
-                model_path=model_path,
-                trained=trained,
-                score_threshold=float(score_threshold),
-                feature_files=candidate_feature_outputs,
-            )
-        )
-    return {"detections": detection_outputs, "candidate_features": candidate_feature_outputs}
+    return {"detections": detection_outputs}

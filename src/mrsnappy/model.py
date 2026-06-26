@@ -46,9 +46,8 @@ def iter_svm_param_grid(sweep_cfg: dict[str, Any]) -> Iterable[dict[str, Any]]:
     box_constraints = sweep_cfg.get("box_constraints", [1.0])
     kernel_scales = sweep_cfg.get("kernel_scales", ["auto"])
     polynomial_orders = sweep_cfg.get("polynomial_orders", [2])
-    standardize = bool(sweep_cfg.get("standardize", True))
-    class_weight_mode = str(sweep_cfg.get("class_weight_mode", "balanced")).strip().lower()
-    class_weights = sweep_cfg.get("class_weights")
+    standardize = _normalize_bool(sweep_cfg.get("standardize", True), "svm_sweep.standardize")
+    class_weighting = _normalize_class_weighting(sweep_cfg.get("class_weighting", "on"))
     for kernel in kernels:
         scales = kernel_scales if str(kernel).lower() != "linear" else [None]
         degrees = polynomial_orders if str(kernel).lower() in {"poly", "polynomial"} else [2]
@@ -56,39 +55,86 @@ def iter_svm_param_grid(sweep_cfg: dict[str, Any]) -> Iterable[dict[str, Any]]:
             for gamma in scales:
                 for degree in degrees:
                     yield {
-                        "kernel": kernel,
-                        "C": float(c_value),
-                        "gamma": gamma,
-                        "degree": int(degree),
+                        "kernel": _normalize_kernel(kernel),
+                        "C": _normalize_positive_float(c_value, "svm_sweep.box_constraints"),
+                        "gamma": _normalize_gamma(gamma) if str(kernel).lower() != "linear" else None,
+                        "degree": _normalize_degree(degree),
                         "standardize": standardize,
-                        "class_weight_mode": class_weight_mode,
-                        "class_weights": class_weights,
+                        "class_weighting": class_weighting,
                     }
 
 
+def _normalize_kernel(kernel: Any) -> str:
+    text = str(kernel).strip().lower()
+    if text in {"poly", "polynomial"}:
+        return "polynomial"
+    if text not in {"linear", "rbf", "polynomial"}:
+        raise ValueError("svm_sweep.kernels must contain only 'linear', 'rbf', or 'polynomial'.")
+    return text
+
+
+def _normalize_bool(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes"}:
+            return True
+        if text in {"false", "0", "no"}:
+            return False
+    raise ValueError(f"{name} must be true or false.")
+
+
+def _normalize_positive_float(value: Any, name: str) -> float:
+    out = float(value)
+    if not np.isfinite(out) or out <= 0.0:
+        raise ValueError(f"{name} must be a positive finite number.")
+    return out
+
+
+def _normalize_gamma(value: Any) -> str | float:
+    if value is None:
+        return "auto"
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"auto", "scale"}:
+            return text
+        return _normalize_positive_float(text, "svm_sweep.kernel_scales")
+    return _normalize_positive_float(value, "svm_sweep.kernel_scales")
+
+
+def _normalize_degree(value: Any) -> int:
+    degree = int(value)
+    if degree < 1:
+        raise ValueError("svm_sweep.polynomial_orders must contain positive integers.")
+    return degree
+
+
+def _normalize_class_weighting(value: Any) -> str:
+    text = str(value).strip().lower()
+    if text not in {"on", "off"}:
+        raise ValueError("svm_sweep.class_weighting must be 'on' or 'off'.")
+    return text
+
+
 def build_svm_pipeline(params: dict[str, Any]) -> Pipeline:
-    kernel = str(params["kernel"]).lower()
-    class_weight_mode = str(params.get("class_weight_mode", "balanced")).lower()
-    if params.get("class_weights") is not None:
-        class_weight = params["class_weights"]
-    elif class_weight_mode == "balanced":
-        class_weight = "balanced"
-    else:
-        class_weight = None
+    kernel = _normalize_kernel(params["kernel"])
+    class_weighting = _normalize_class_weighting(params.get("class_weighting", "on"))
+    class_weight = "balanced" if class_weighting == "on" else None
 
     kwargs: dict[str, Any] = {
-        "kernel": "poly" if kernel in {"poly", "polynomial"} else kernel,
-        "C": float(params["C"]),
+        "kernel": "poly" if kernel == "polynomial" else kernel,
+        "C": _normalize_positive_float(params["C"], "svm_sweep.box_constraints"),
         "class_weight": class_weight,
     }
     if kernel == "rbf":
-        kwargs["gamma"] = params.get("gamma", "auto")
-    if kernel in {"poly", "polynomial"}:
-        kwargs["gamma"] = params.get("gamma", "auto")
-        kwargs["degree"] = int(params.get("degree", 2))
+        kwargs["gamma"] = _normalize_gamma(params.get("gamma", "auto"))
+    if kernel == "polynomial":
+        kwargs["gamma"] = _normalize_gamma(params.get("gamma", "auto"))
+        kwargs["degree"] = _normalize_degree(params.get("degree", 2))
 
     steps: list[tuple[str, Any]] = []
-    if bool(params.get("standardize", True)):
+    if _normalize_bool(params.get("standardize", True), "svm_sweep.standardize"):
         steps.append(("scale", StandardScaler()))
     steps.append(("svc", SVC(**kwargs)))
     return Pipeline(steps)

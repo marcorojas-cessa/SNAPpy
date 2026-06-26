@@ -1,14 +1,20 @@
 import pandas as pd
 import pytest
 
-from mrsnappy.config import DEFAULT_NATIVE_CONFIG, deep_merge, recipe_bank
+from mrsnappy.config import DEFAULT_NATIVE_CONFIG, deep_merge, load_config, recipe_bank
 from mrsnappy.optimizer import (
+    _FINALIST_SORT_ASCENDING,
+    _FINALIST_SORT_COLUMNS,
+    _add_stage2_selection_columns,
     _apply_preflight_decision_columns,
-    _auto_candidate_ratio_cap,
     _expand_stage2_shortlist,
     _enforce_optimizer_plan_safety,
+    _mean_per_image_candidate_ratio,
     _stage1_failure_reasons,
+    _stage1_guardrail_progress,
+    _stage2_parameter_payload,
     _stage2_shortlist_from_passed,
+    _svm_parameter_payload,
     optimizer_plan,
 )
 
@@ -20,18 +26,253 @@ def test_stage1_failure_reasons_are_explicit_and_minimal() -> None:
         max_candidates=4500,
         mean_candidate_ratio=101.0,
         preflight_cfg={
-            "min_stage1_recall": 0.25,
+            "min_stage1_recall_mean": 0.25,
             "max_stage1_candidates_mean": 2500,
             "max_stage1_candidates_single": 4000,
-            "max_stage1_candidates_per_label_mean": 100.0,
+            "max_candidate_ratio_cap_mean": 100.0,
         },
     )
 
     assert reasons == [
-        "recall 0.1000 < minimum 0.2500",
+        "mean recall 0.1000 < minimum 0.2500",
         "mean candidates 3000.0 > maximum 2500.0",
         "single-image candidates 4500 > maximum 4000",
-        "candidate/label ratio 101.00 > maximum 100.00",
+        "candidate/ground-truth ratio 101.00 > maximum 100.00",
+    ]
+
+
+def test_absent_candidate_ratio_cap_disables_ratio_guardrail() -> None:
+    reasons = _stage1_failure_reasons(
+        mean_recall=1.0,
+        mean_candidates=100.0,
+        max_candidates=100,
+        mean_candidate_ratio=1000.0,
+        preflight_cfg={
+            "min_stage1_recall_mean": 0.25,
+            "max_stage1_candidates_mean": 2500,
+            "max_stage1_candidates_single": 4000,
+            "max_candidate_ratio_cap_mean": None,
+        },
+    )
+
+    assert reasons == []
+
+
+def test_removed_candidate_ratio_cap_enabled_is_rejected(tmp_path) -> None:
+    config_path = tmp_path / "optimize.json"
+    config_path.write_text('{"preflight": {"candidate_ratio_cap_enabled": false}}')
+
+    with pytest.raises(ValueError, match="Unsupported preflight key"):
+        load_config(config_path)
+
+
+def test_stage1_n_val_images_accepts_positive_integer_or_all(tmp_path) -> None:
+    config_path = tmp_path / "optimize.json"
+    config_path.write_text('{"preflight": {"stage1_n_val_images": "all"}}')
+    assert load_config(config_path)["preflight"]["stage1_n_val_images"] == "all"
+
+    config_path.write_text('{"preflight": {"stage1_n_val_images": 0}}')
+    with pytest.raises(ValueError, match="stage1_n_val_images"):
+        load_config(config_path)
+
+    config_path.write_text('{"preflight": {"stage1_n_val_images": 1.5}}')
+    with pytest.raises(ValueError, match="stage1_n_val_images"):
+        load_config(config_path)
+
+
+def test_preflight_numeric_guardrails_reject_invalid_values(tmp_path) -> None:
+    config_path = tmp_path / "optimize.json"
+    invalid_payloads = [
+        '{"preflight": {"min_stage1_recall_mean": 0}}',
+        '{"preflight": {"min_stage1_recall_mean": 1.01}}',
+        '{"preflight": {"max_stage1_candidates_mean": 0}}',
+        '{"preflight": {"max_stage1_candidates_single": 0}}',
+    ]
+
+    for payload in invalid_payloads:
+        config_path.write_text(payload)
+        with pytest.raises(ValueError):
+            load_config(config_path)
+
+
+def test_old_min_stage1_recall_name_is_rejected(tmp_path) -> None:
+    config_path = tmp_path / "optimize.json"
+    config_path.write_text('{"preflight": {"min_stage1_recall": 0.25}}')
+
+    with pytest.raises(ValueError, match="min_stage1_recall_mean"):
+        load_config(config_path)
+
+
+def test_candidate_ratio_cap_rejects_string_values(tmp_path) -> None:
+    config_path = tmp_path / "optimize.json"
+    config_path.write_text('{"preflight": {"max_candidate_ratio_cap_mean": "invalid"}}')
+
+    with pytest.raises(ValueError, match="max_candidate_ratio_cap_mean"):
+        load_config(config_path)
+
+
+def test_scalar_svm_settings_do_not_clear_default_svm_sweep(tmp_path) -> None:
+    config_path = tmp_path / "optimize.json"
+    config_path.write_text('{"svm_sweep": {"class_weighting": "off"}}')
+
+    cfg = load_config(config_path)
+
+    assert cfg["svm_sweep"]["class_weighting"] == "off"
+    assert cfg["svm_sweep"]["kernels"] == DEFAULT_NATIVE_CONFIG["svm_sweep"]["kernels"]
+    assert cfg["svm_sweep"]["box_constraints"] == DEFAULT_NATIVE_CONFIG["svm_sweep"]["box_constraints"]
+
+
+def test_stage1_ranking_config_rejects_invalid_values(tmp_path) -> None:
+    config_path = tmp_path / "optimize.json"
+    invalid_payloads = [
+        '{"stage1_ranking": {"recall_tolerance": -0.1}}',
+        '{"stage1_ranking": {"recall_tolerance": 1.1}}',
+        '{"optimizer": {"shortlist_top_k": 0}}',
+    ]
+
+    for payload in invalid_payloads:
+        config_path.write_text(payload)
+        with pytest.raises(ValueError):
+            load_config(config_path)
+
+
+def test_removed_optimizer_selection_margin_is_rejected(tmp_path) -> None:
+    config_path = tmp_path / "optimize.json"
+    config_path.write_text('{"optimizer": {"selection_margin": 0.005}}')
+
+    with pytest.raises(ValueError, match="Unsupported optimizer key"):
+        load_config(config_path)
+
+
+def test_removed_stage1_ranking_pool_size_is_rejected(tmp_path) -> None:
+    config_path = tmp_path / "optimize.json"
+    config_path.write_text('{"stage1_ranking": {"ranking_pool_size": 10}}')
+
+    with pytest.raises(ValueError, match="Unsupported stage1_ranking key"):
+        load_config(config_path)
+
+
+def test_stage1_candidate_ratio_is_true_per_image_mean() -> None:
+    image_rows = [
+        {"n_candidates": 100, "n_labels": 100},
+        {"n_candidates": 10, "n_labels": 1},
+    ]
+
+    assert _mean_per_image_candidate_ratio(image_rows) == pytest.approx(5.5)
+
+
+def test_null_preflight_guardrails_are_not_used() -> None:
+    reasons = _stage1_failure_reasons(
+        mean_recall=0.0,
+        mean_candidates=999999.0,
+        max_candidates=999999,
+        mean_candidate_ratio=999999.0,
+        preflight_cfg={
+            "min_stage1_recall_mean": None,
+            "max_stage1_candidates_mean": None,
+            "max_stage1_candidates_single": None,
+            "max_candidate_ratio_cap_mean": None,
+        },
+    )
+
+    assert reasons == []
+
+
+def test_stage1_guardrail_progress_allows_recipes_that_can_still_pass() -> None:
+    progress = _stage1_guardrail_progress(
+        [{"n_candidates": 1000, "n_labels": 10, "recall": 0.0}],
+        total_preflight_images=4,
+        preflight_cfg={
+            "min_stage1_recall_mean": 0.25,
+            "max_stage1_candidates_mean": 2500,
+            "max_stage1_candidates_single": 5000,
+            "max_candidate_ratio_cap_mean": None,
+        },
+    )
+
+    assert progress["can_still_pass"]
+    assert progress["maximum_possible_mean_recall"] == pytest.approx(0.75)
+    assert progress["minimum_possible_mean_candidates"] == pytest.approx(250.0)
+
+
+def test_stage1_guardrail_progress_stops_on_single_image_candidate_cap() -> None:
+    progress = _stage1_guardrail_progress(
+        [{"n_candidates": 5001, "n_labels": 10, "recall": 1.0}],
+        total_preflight_images=4,
+        preflight_cfg={
+            "min_stage1_recall_mean": 0.25,
+            "max_stage1_candidates_mean": 2500,
+            "max_stage1_candidates_single": 5000,
+            "max_candidate_ratio_cap_mean": None,
+        },
+    )
+
+    assert not progress["can_still_pass"]
+    assert progress["definitive_failure_reasons"] == ["single-image candidates 5001 > maximum 5000"]
+
+
+def test_stage1_guardrail_progress_stops_on_unrecoverable_mean_candidates() -> None:
+    progress = _stage1_guardrail_progress(
+        [
+            {"n_candidates": 5000, "n_labels": 10, "recall": 1.0},
+            {"n_candidates": 5000, "n_labels": 10, "recall": 1.0},
+            {"n_candidates": 1, "n_labels": 10, "recall": 1.0},
+        ],
+        total_preflight_images=4,
+        preflight_cfg={
+            "min_stage1_recall_mean": 0.25,
+            "max_stage1_candidates_mean": 2500,
+            "max_stage1_candidates_single": 5000,
+            "max_candidate_ratio_cap_mean": None,
+        },
+    )
+
+    assert not progress["can_still_pass"]
+    assert progress["definitive_failure_reasons"] == [
+        "minimum possible mean candidates 2500.2 > maximum 2500.0"
+    ]
+
+
+def test_stage1_guardrail_progress_stops_on_unrecoverable_mean_recall() -> None:
+    progress = _stage1_guardrail_progress(
+        [
+            {"n_candidates": 10, "n_labels": 10, "recall": 0.0},
+            {"n_candidates": 10, "n_labels": 10, "recall": 0.0},
+        ],
+        total_preflight_images=4,
+        preflight_cfg={
+            "min_stage1_recall_mean": 0.75,
+            "max_stage1_candidates_mean": 2500,
+            "max_stage1_candidates_single": 5000,
+            "max_candidate_ratio_cap_mean": None,
+        },
+    )
+
+    assert not progress["can_still_pass"]
+    assert progress["definitive_failure_reasons"] == [
+        "maximum possible mean recall 0.5000 < minimum 0.7500"
+    ]
+
+
+def test_stage1_guardrail_progress_stops_on_unrecoverable_candidate_ratio() -> None:
+    progress = _stage1_guardrail_progress(
+        [
+            {"n_candidates": 1000, "n_labels": 10, "recall": 1.0},
+            {"n_candidates": 1000, "n_labels": 10, "recall": 1.0},
+            {"n_candidates": 1000, "n_labels": 10, "recall": 1.0},
+        ],
+        total_preflight_images=4,
+        preflight_cfg={
+            "min_stage1_recall_mean": 0.25,
+            "max_stage1_candidates_mean": 2500,
+            "max_stage1_candidates_single": 5000,
+            "max_candidate_ratio_cap_mean": 50.0,
+        },
+    )
+
+    assert not progress["can_still_pass"]
+    assert progress["definitive_failure_reasons"] == [
+        "minimum possible candidate/ground-truth ratio 75.00 > maximum 50.00"
     ]
 
 
@@ -41,29 +282,23 @@ def test_preflight_decision_columns_rank_shortlist_and_stage2() -> None:
             {
                 "recipe_id": "low_recall",
                 "passed": False,
-                "preflight_utility": 0.8,
                 "mean_stage1_recall": 0.1,
                 "mean_stage1_precision": 0.9,
-                "fit_cost_rank": 0,
-                "feature_count": 16,
+                "mean_stage1_candidate_ratio": 1.0,
             },
             {
                 "recipe_id": "winner",
                 "passed": True,
-                "preflight_utility": 0.7,
                 "mean_stage1_recall": 0.9,
                 "mean_stage1_precision": 0.4,
-                "fit_cost_rank": 0,
-                "feature_count": 16,
+                "mean_stage1_candidate_ratio": 1.0,
             },
             {
                 "recipe_id": "runner_up",
                 "passed": True,
-                "preflight_utility": 0.6,
-                "mean_stage1_recall": 0.8,
-                "mean_stage1_precision": 0.5,
-                "fit_cost_rank": 0,
-                "feature_count": 16,
+                "mean_stage1_recall": 0.89,
+                "mean_stage1_precision": 0.2,
+                "mean_stage1_candidate_ratio": 1.0,
             },
         ]
     )
@@ -78,32 +313,22 @@ def test_preflight_decision_columns_rank_shortlist_and_stage2() -> None:
     assert out.loc[out["recipe_id"] == "runner_up", "selected_for_stage2"].item()
 
 
-def test_default_auto_candidate_ratio_caps_match_current_policy() -> None:
-    preflight_cfg = DEFAULT_NATIVE_CONFIG["preflight"]
-
-    assert _auto_candidate_ratio_cap({"density_regime": "sparse", "contrast_regime": "moderate"}, preflight_cfg) == 130.0
-    assert _auto_candidate_ratio_cap({"density_regime": "moderate", "contrast_regime": "moderate"}, preflight_cfg) == 100.0
-    assert _auto_candidate_ratio_cap({"density_regime": "dense", "contrast_regime": "moderate"}, preflight_cfg) == 70.0
-    assert _auto_candidate_ratio_cap({"density_regime": "moderate", "contrast_regime": "low"}, preflight_cfg) == 125.0
-    assert _auto_candidate_ratio_cap({"density_regime": "moderate", "contrast_regime": "high"}, preflight_cfg) == 85.0
-
-
 def test_stage1_shortlist_selects_top_unique_stage1_configs() -> None:
     df = pd.DataFrame(
         [
             {
                 "recipe_id": "stage1_a",
                 "stage1_key": "stage1_a",
-                "preflight_utility": 0.9,
                 "mean_stage1_recall": 0.9,
                 "mean_stage1_precision": 0.4,
+                "mean_stage1_candidate_ratio": 1.0,
             },
             {
                 "recipe_id": "stage1_b",
                 "stage1_key": "stage1_b",
-                "preflight_utility": 0.8,
                 "mean_stage1_recall": 0.8,
                 "mean_stage1_precision": 0.5,
+                "mean_stage1_candidate_ratio": 1.0,
             },
         ]
     )
@@ -114,32 +339,74 @@ def test_stage1_shortlist_selects_top_unique_stage1_configs() -> None:
     assert set(shortlist["recipe_id"]) == {"stage1_a"}
 
 
-def test_stage1_shortlist_prefers_lower_processing_cost_on_metric_ties() -> None:
+def test_stage1_shortlist_uses_recall_band_then_highest_f1() -> None:
     df = pd.DataFrame(
         [
             {
-                "recipe_id": "expensive_rb10",
-                "stage1_key": "expensive_rb10",
-                "preflight_utility": 0.9,
-                "mean_stage1_recall": 0.9,
-                "mean_stage1_precision": 0.4,
-                "processing_cost_rank": 1010.0,
+                "recipe_id": "highest_recall_low_f1",
+                "stage1_key": "highest_recall_low_f1",
+                "mean_stage1_recall": 0.95,
+                "mean_stage1_precision": 0.10,
+                "mean_stage1_candidate_ratio": 100.0,
             },
             {
-                "recipe_id": "cheap_no_background",
-                "stage1_key": "cheap_no_background",
-                "preflight_utility": 0.9,
+                "recipe_id": "near_recall_best_f1",
+                "stage1_key": "near_recall_best_f1",
+                "mean_stage1_recall": 0.94,
+                "mean_stage1_precision": 0.80,
+                "mean_stage1_candidate_ratio": 1.0,
+            },
+            {
+                "recipe_id": "near_recall_lower_f1",
+                "stage1_key": "near_recall_lower_f1",
+                "mean_stage1_recall": 0.93,
+                "mean_stage1_precision": 0.60,
+                "mean_stage1_candidate_ratio": 2.0,
+            },
+            {
+                "recipe_id": "low_recall_clean_fast",
+                "stage1_key": "low_recall_clean_fast",
+                "mean_stage1_recall": 0.80,
+                "mean_stage1_precision": 0.99,
+                "mean_stage1_candidate_ratio": 1.0,
+            },
+        ]
+    )
+
+    shortlist, selected_keys = _stage2_shortlist_from_passed(
+        df,
+        top_k=1,
+        ranking_cfg={"recall_tolerance": 0.02},
+    )
+
+    assert selected_keys == ["near_recall_best_f1"]
+    assert set(shortlist["recipe_id"]) == {"near_recall_best_f1"}
+
+
+def test_stage1_shortlist_prefers_recipe_id_on_f1_ties() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "recipe_id": "a_expensive_rb10",
+                "stage1_key": "a_expensive_rb10",
                 "mean_stage1_recall": 0.9,
                 "mean_stage1_precision": 0.4,
-                "processing_cost_rank": 2.0,
+                "mean_stage1_candidate_ratio": 1.0,
+            },
+            {
+                "recipe_id": "b_cheap_no_background",
+                "stage1_key": "b_cheap_no_background",
+                "mean_stage1_recall": 0.9,
+                "mean_stage1_precision": 0.4,
+                "mean_stage1_candidate_ratio": 1.0,
             },
         ]
     )
 
     shortlist, selected_keys = _stage2_shortlist_from_passed(df, top_k=1)
 
-    assert selected_keys == ["cheap_no_background"]
-    assert set(shortlist["recipe_id"]) == {"cheap_no_background"}
+    assert selected_keys == ["a_expensive_rb10"]
+    assert set(shortlist["recipe_id"]) == {"a_expensive_rb10"}
 
 
 def test_stage2_expands_feature_packs_only_after_stage1_shortlist() -> None:
@@ -150,9 +417,9 @@ def test_stage2_expands_feature_packs_only_after_stage1_shortlist() -> None:
             {
                 "recipe_id": stage1_recipe["recipe_id"],
                 "stage1_key": "stage1_a",
-                "preflight_utility": 1.0,
                 "mean_stage1_recall": 1.0,
                 "mean_stage1_precision": 1.0,
+                "mean_stage1_candidate_ratio": 1.0,
                 "stage1_rank_passed": 1,
                 "passed": True,
                 "recipe": stage1_recipe,
@@ -162,22 +429,151 @@ def test_stage2_expands_feature_packs_only_after_stage1_shortlist() -> None:
     stage1_shortlist, _ = _stage2_shortlist_from_passed(passed, top_k=1)
     stage2_shortlist = _expand_stage2_shortlist(stage1_shortlist, cfg)
 
-    assert len(stage2_shortlist) == 7
+    assert len(stage2_shortlist) == 4
     assert set(stage2_shortlist["feature_pack_name"]) == set(cfg["stage2_feature_packs"])
     assert set(stage2_shortlist["stage1_recipe_id"]) == {stage1_recipe["recipe_id"]}
+    cache_feature_sets = {tuple(recipe["feature_cache_features"]) for recipe in stage2_shortlist["recipe"]}
+    assert len(cache_feature_sets) == 1
 
 
-def test_auto_candidate_ratio_caps_are_user_configurable() -> None:
-    preflight_cfg = {
-        **DEFAULT_NATIVE_CONFIG["preflight"],
-        "auto_candidate_ratio_caps": {"sparse": 10.0, "moderate": 20.0, "dense": 30.0},
-        "auto_candidate_ratio_low_contrast_multiplier": 2.0,
-        "auto_candidate_ratio_high_contrast_multiplier": 0.5,
+def test_all_positive_stage1_shortlist_expands_to_single_pass_through_recipe() -> None:
+    cfg = deep_merge(DEFAULT_NATIVE_CONFIG, {})
+    stage1_recipe = recipe_bank(cfg)[0]
+    stage1_shortlist = pd.DataFrame(
+        [
+            {
+                "recipe_id": stage1_recipe["recipe_id"],
+                "stage1_key": "stage1_a",
+                "stage1_rank_passed": 1,
+                "passed": True,
+                "stage1_train_label_status": "all_positive_stage1",
+                "recipe": stage1_recipe,
+            }
+        ]
+    )
+
+    stage2_shortlist = _expand_stage2_shortlist(stage1_shortlist, cfg)
+
+    assert len(stage2_shortlist) == 1
+    recipe = stage2_shortlist.iloc[0]["recipe"]
+    assert recipe["model_type"] == "stage1_pass_through"
+    assert recipe["feature_pack_name"] == "not_applicable"
+    assert recipe["selected_features"] == []
+    assert recipe["feature_cache_features"] == []
+    assert recipe["fit_method"] == "2D (XY) + 1D (Z) Gaussian"
+
+
+def test_stage1_pass_through_export_payload_has_no_svm_or_features() -> None:
+    recipe = {
+        "recipe_id": "stage1_a_stage1_pass_through",
+        "fit_method": "2D (XY) + 1D (Z) Gaussian",
+        "fit_window": 7,
+        "feature_pack_name": "not_applicable",
+        "selected_features": [],
+        "model_type": "stage1_pass_through",
+    }
+    winner = pd.Series({"recipe": recipe, "model_type": "stage1_pass_through", "decision_threshold": 0.0})
+
+    assert _svm_parameter_payload(winner) is None
+    assert _stage2_parameter_payload(recipe, winner) == {
+        "model_type": "stage1_pass_through",
+        "fitting_mode": "2D (XY) + 1D (Z) Gaussian",
+        "fit_window": 7,
+        "fit_background_width": None,
+        "fit_max_iterations": None,
+        "fit_tolerance": None,
+        "feature_pack_name": "not_applicable",
+        "selected_features": [],
+        "svm": None,
+        "decision_rule": "accept_all_stage1_candidates",
+        "decision_threshold": None,
     }
 
-    assert _auto_candidate_ratio_cap({"density_regime": "sparse", "contrast_regime": "moderate"}, preflight_cfg) == 10.0
-    assert _auto_candidate_ratio_cap({"density_regime": "moderate", "contrast_regime": "low"}, preflight_cfg) == 40.0
-    assert _auto_candidate_ratio_cap({"density_regime": "dense", "contrast_regime": "high"}, preflight_cfg) == 15.0
+
+def test_stage2_finalist_ranking_prefers_simpler_near_ties() -> None:
+    assert _FINALIST_SORT_COLUMNS == [
+        "feature_pack_simplicity_rank",
+        "model_type_simplicity_rank",
+        "svm_kernel_simplicity_rank",
+        "svm_c_simplicity_rank",
+        "svm_degree_simplicity_rank",
+        "svm_gamma_simplicity_rank",
+        "stage1_rank_passed",
+        "recipe_id",
+    ]
+    assert _FINALIST_SORT_ASCENDING == [True] * len(_FINALIST_SORT_COLUMNS)
+
+    df = _add_stage2_selection_columns(
+        pd.DataFrame(
+            [
+                {
+                    "recipe_id": "complex_best_f1",
+                    "feature_pack_name": "full_interpretable",
+                    "model_type": "svm",
+                    "kernel": "rbf",
+                    "C": 10.0,
+                    "gamma": 10.0,
+                    "degree": 2,
+                    "val_f1": 1.0,
+                    "stage1_rank_passed": 1,
+                },
+                {
+                    "recipe_id": "simple_near_tie",
+                    "feature_pack_name": "core_fit",
+                    "model_type": "svm",
+                    "kernel": "linear",
+                    "C": 1.0,
+                    "gamma": "auto",
+                    "degree": 2,
+                    "val_f1": 0.996,
+                    "stage1_rank_passed": 2,
+                },
+            ]
+        )
+    )
+    finalists = df[df["stage2_f1_loss"] <= 0.005].sort_values(
+        _FINALIST_SORT_COLUMNS,
+        ascending=_FINALIST_SORT_ASCENDING,
+    )
+
+    assert finalists.iloc[0]["recipe_id"] == "simple_near_tie"
+
+
+def test_stage2_finalist_ranking_uses_stage1_rank_not_f1_loss_after_simplicity_ties() -> None:
+    df = _add_stage2_selection_columns(
+        pd.DataFrame(
+            [
+                {
+                    "recipe_id": "higher_f1_worse_stage1_rank",
+                    "feature_pack_name": "core_fit",
+                    "model_type": "svm",
+                    "kernel": "linear",
+                    "C": 1.0,
+                    "gamma": "auto",
+                    "degree": 2,
+                    "val_f1": 1.0,
+                    "stage1_rank_passed": 2,
+                },
+                {
+                    "recipe_id": "lower_f1_better_stage1_rank",
+                    "feature_pack_name": "core_fit",
+                    "model_type": "svm",
+                    "kernel": "linear",
+                    "C": 1.0,
+                    "gamma": "auto",
+                    "degree": 2,
+                    "val_f1": 0.996,
+                    "stage1_rank_passed": 1,
+                },
+            ]
+        )
+    )
+    finalists = df[df["stage2_f1_loss"] <= 0.005].sort_values(
+        _FINALIST_SORT_COLUMNS,
+        ascending=_FINALIST_SORT_ASCENDING,
+    )
+
+    assert finalists.iloc[0]["recipe_id"] == "lower_f1_better_stage1_rank"
 
 
 def test_optimizer_plan_counts_stage1_before_stage2_expansion(tmp_path) -> None:
@@ -186,17 +582,17 @@ def test_optimizer_plan_counts_stage1_before_stage2_expansion(tmp_path) -> None:
 
     plan = optimizer_plan(config_path)
 
-    assert plan["stage1_recipe_bank_entries"] == 432
-    assert plan["unique_stage1_preflight_configs"] == 432
-    assert plan["shortlist_top_k"] == 3
-    assert plan["max_stage2_recipe_entries_after_shortlist"] == 21
-    assert plan["svm_param_grid_entries_per_stage2_recipe"] == 35
+    assert plan["stage1_recipe_bank_entries"] == 144
+    assert plan["unique_stage1_preflight_configs"] == 144
+    assert plan["shortlist_top_k"] == 5
+    assert plan["max_stage2_recipe_entries_after_shortlist"] == 20
+    assert plan["svm_param_grid_entries_per_stage2_recipe"] == 48
 
 
 def test_optimizer_plan_safety_stops_accidental_large_runs() -> None:
     cfg = {"optimizer": {"max_stage1_preflight_configs": 10, "max_stage2_recipes_after_shortlist": 20}}
     plan = {
-        "unique_stage1_preflight_configs": 432,
+        "unique_stage1_preflight_configs": 144,
         "max_stage2_recipe_entries_after_shortlist": 21,
     }
 

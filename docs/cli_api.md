@@ -1,10 +1,20 @@
-# CLI and API Reference
+# CLI, API, and Config Reference
 
-SNAPpy exposes three command-line workflows and matching Python API functions.
-The CLI is recommended for routine use. The Python API is intended for scripts
-that need the same behavior without shelling out.
+SNAPpy has three user-facing commands:
 
-## 1. Initialize an Optimizer Config
+```bash
+mrsnappy init-config
+mrsnappy optimize
+mrsnappy detect
+```
+
+The matching Python API functions are:
+
+```python
+from mrsnappy import init_config, optimize, optimize_dry_run, detect
+```
+
+## 1. Write a Config
 
 CLI:
 
@@ -20,26 +30,25 @@ from mrsnappy import init_config
 init_config("config.yaml")
 ```
 
-Purpose: write an editable default optimizer config. This does not read images,
-train a model, or run detection.
+This writes an editable YAML config. It does not read images, optimize a model, or run detection.
 
-Input:
+Before optimizing, set the physical voxel spacing:
 
-- `--output` / `output`: path to the YAML config file to create.
+```yaml
+pipeline_defaults:
+  xy_spacing_nm: 128.866
+  z_spacing_nm: 300.0
+```
 
-Output:
+Use the real pixel spacing and z-step spacing for your microscope data.
 
-- `config.yaml`: editable optimizer config with Stage 1 sweep settings, Stage 1
-  guardrails, Stage 2 feature/SVM settings, export flags, and runtime cache
-  settings.
-
-## 2. Optimize a SNAPpy Model
+## 2. Optimize a Model
 
 CLI:
 
 ```bash
 mrsnappy optimize \
-  --train-dir /path/to/labeled_dataset \
+  --dataset-root /path/to/labeled_dataset \
   --out-dir /path/to/model \
   --config config.yaml
 ```
@@ -50,16 +59,27 @@ Python:
 from mrsnappy import optimize
 
 optimize(
-    train_dir="/path/to/labeled_dataset",
+    dataset_root="/path/to/labeled_dataset",
     out_dir="/path/to/model",
     config="config.yaml",
 )
 ```
 
-Purpose: train and select a SNAPpy model from labeled `train/` and `val/`
-images.
+Dry run:
 
-Dataset input:
+```bash
+mrsnappy optimize \
+  --dataset-root /path/to/labeled_dataset \
+  --out-dir /path/to/model \
+  --config config.yaml \
+  --dry-run
+```
+
+`--dry-run` writes an optimizer plan without fitting a model.
+
+### Optimize Inputs
+
+The current implemented optimization mode is `fixed_split`. The dataset root must contain user-defined `train/` and `val/` folders:
 
 ```text
 labeled_dataset/
@@ -71,78 +91,54 @@ labeled_dataset/
     image_101.csv
 ```
 
-Ground-truth CSV files must contain `x`, `y`, and `z` voxel-coordinate columns.
-TIFF images must contain finite numeric voxel values.
+Each 3D TIFF must have a same-stem CSV label file. Label CSV files must contain `x`, `y`, and `z` voxel-coordinate columns.
 
-Main options:
-
-- `--config` / `config`: `default` or a JSON/YAML optimizer config path.
-- `--train-dir` / `train_dir`: dataset root containing `train/` and `val/`.
-- `--out-dir` / `out_dir`: output directory for the optimized model and optimizer records.
-- `--dataset-name` / `dataset_name`: optional name written to metadata.
-- `--match-distance` / `match_distance`: candidate-to-GT matching distance in
-  voxel units.
-- `--dry-run` / `optimize_dry_run(...)`: write and return the optimizer plan
-  without training.
-- `--export-optimize-report` / `export_optimize_report=True`: export concise
-  Stage 1 and Stage 2 decision records.
-- `--export-candidate-features` / `export_candidate_features=True`: export
-  validation candidate features for the winning pipeline only.
-
-Core output:
+### Optimize Outputs
 
 ```text
 model/
   model.joblib
-  model_manifest.json
-  effective_config.yaml
-  optimizer_plan.json
-  dataset_profile.json
-  summary.json
-  summary.md
+  model_config.json
+  model_summary.md
+  optimization_splits.csv
 ```
 
-Optional report output:
+| File | Contents |
+|---|---|
+| `model.joblib` | Trained native SNAPpy model used by `mrsnappy detect`. |
+| `model_config.json` | Machine-readable effective config, dataset profile, optimizer plan, train/validation split summary, final model parameters, selected features, SVM settings when applicable, validation metrics, Stage 1 shortlist, and near-tie Stage 2 finalists. |
+| `model_summary.md` | Human-readable summary of the optimized model. |
+| `optimization_splits.csv` | Exact image and label paths used as `train/` and `val/`. |
 
-```text
-model/
-  export_optimize_report/
-    stage1_recipes.csv
-    stage1_by_image.csv
-    stage1_summary.csv
-    stage2_recipes.csv
-    stage2_summary.csv
-    selection_decision.json
-    selection_decision.md
-```
-
-Optional candidate-feature output:
-
-```text
-model/
-  export_candidate_features/
-    val_candidates.csv
-    candidate_features_manifest.json
-```
-
-Optimization logic:
-
-- `val/` screens and ranks Stage 1 recipes.
-- `train/` provides candidate feature rows used to fit each Stage 2 SVM.
-- all `val/` images are used to score each Stage 2 SVM setting and tune the
-  final threshold.
-- external benchmark `test/` images should be scored after optimization with
-  `mrsnappy detect`.
+Official SNAPpy does not export full candidate-feature tables, per-image benchmark tables, localization-offset tables, or resource metrics. Those belong in benchmark wrapper code.
 
 ## 3. Detect Puncta
 
-CLI:
+One image:
 
 ```bash
 mrsnappy detect \
   --model /path/to/model/model.joblib \
-  --input image.tif \
-  --output detections.csv
+  --input /path/to/image.tif \
+  --output /path/to/detections.csv
+```
+
+Folder:
+
+```bash
+mrsnappy detect \
+  --model /path/to/model/model.joblib \
+  --input /path/to/images \
+  --output /path/to/detections
+```
+
+Image list:
+
+```bash
+mrsnappy detect \
+  --model /path/to/model/model.joblib \
+  --input-list image_paths.txt \
+  --output /path/to/detections
 ```
 
 Python:
@@ -150,58 +146,215 @@ Python:
 ```python
 from mrsnappy import detect
 
-detect(model="/path/to/model/model.joblib", input_path="image.tif", output="detections.csv")
+detect(
+    model="/path/to/model/model.joblib",
+    input_path="/path/to/images",
+    output="/path/to/detections",
+)
 ```
 
-Purpose: apply a native SNAPpy model to one image, a folder of TIFF images, or
-an explicit image list.
-
-Model input:
-
-- `/path/to/model.joblib`: a native model generated by the current
-  `mrsnappy optimize` workflow.
-
-Image input:
-
-- `--input image.tif` / `input_path="image.tif"` for one image.
-- `--input images/` / `input_path="images/"` for a folder.
-- `--input-list image_paths.txt` / `input_list="image_paths.txt"` for a text
-  file with one image path per line.
-
-Output:
-
-- For one image, `--output detections.csv` writes one detection CSV.
-- For multiple images, `--output detections/` writes one CSV per input image.
+For multiple images, output CSV names follow the input image stem. For example, `cell_A_003.tif` becomes `cell_A_003.csv`.
 
 Detection CSV columns:
 
-- `detection_id`: 1-based ID within that image.
-- `x`, `y`, `z`: subpixel voxel coordinates.
-- `score`: model score after Stage 2 scoring or Stage 1 pass-through scoring.
+| Column | Meaning |
+|---|---|
+| `detection_id` | 1-based detection ID within the image. |
+| `x`, `y`, `z` | Subpixel voxel coordinates. `z` is the stack axis. |
+| `score` | SVM decision score, or Stage 1 score for Stage 1 pass-through models. |
 
-Optional candidate-feature export:
+## CLI Options
 
-```bash
-mrsnappy detect \
-  --model /path/to/model/model.joblib \
-  --input images/ \
-  --output detections/ \
-  --export-candidate-features
-```
+### `init-config`
 
-This writes `export_candidate_features/` next to the detection outputs. Each
-candidate-feature CSV includes candidate coordinates, `maxima_score`,
-`svm_score`, `model_score`, `decision_threshold`, `accepted_by_model`,
-`accepted_detection_id`, and the selected model feature columns.
+| Option | Meaning |
+|---|---|
+| `--output` | YAML config path to write. |
+
+### `optimize`
+
+| Option | Meaning |
+|---|---|
+| `--dataset-root` | Labeled dataset root. In `fixed_split` mode it contains `train/` and `val/`. |
+| `--out-dir` | Output folder for `model.joblib` and optimization records. |
+| `--config` | `default` or a JSON/YAML config path. Use an edited config for real optimization. |
+| `--dataset-name` | Optional name written to metadata. |
+| `--dry-run` | Write and print the optimizer plan without training. |
+
+### `detect`
+
+| Option | Meaning |
+|---|---|
+| `--model` | Path to a native `model.joblib` created by `mrsnappy optimize`. |
+| `--input` | One TIFF image or a folder of TIFF images. |
+| `--input-list` | Text file with one TIFF path per line. |
+| `--output` | Output CSV for one image, or output folder for multiple images. |
+| `--config` | Optional pipeline override. Most users should omit this because optimized models embed their recipe. |
+| `--score-threshold` | Optional override for the model decision threshold. |
+
+## Config Reference
+
+The default config is the recommended starting point. Matrix fields are literal: if you provide a custom matrix list, SNAPpy sweeps only the values listed in your config.
+
+### Top-Level Settings
+
+| Key | Expected value | Meaning |
+|---|---|---|
+| `dataset_name` | string | Short name written to metadata. |
+| `dataset_root` | path or `null` | Usually supplied by `--dataset-root`; fixed-split root containing `train/` and `val/`. |
+| `optimization_mode` | `fixed_split` | Current implemented mode. Cross-validation is planned but not implemented. |
+| `match_distance` | positive number or `null` | Candidate-to-ground-truth matching radius in voxel units. Do not use with `match_distance_nm`. |
+| `match_distance_nm` | positive number or `null` | Candidate-to-ground-truth matching radius in nanometers. Requires `xy_spacing_nm` and `z_spacing_nm`. Do not use with `match_distance`. |
+| `stage1_detector_set` | `hmax` or `log` | Built-in Stage 1 detector family to sweep. |
+| `stage1_recipes` | list of recipe mappings | Optional explicit Stage 1 recipes. If supplied, these replace the built-in detector-set matrix. |
+| `stage2_feature_packs` | list | Feature packs swept in Stage 2. Defaults to `core_fit`, `core_contrast`, `core_morphology`, and `full_interpretable`. |
+
+Exactly one of `match_distance` or `match_distance_nm` must be set.
+
+### Stage 1 Sweep Lists
+
+| Key | Expected value | Meaning |
+|---|---|---|
+| `stage1_log_sigmas` | list of positive numbers | LoG Gaussian sigmas in voxel units. |
+| `stage1_log_sigmas_nm` | list of positive numbers | LoG Gaussian sigmas in nanometers. |
+| `stage1_log_thresholds` | list of numbers | Thresholds applied to robust-z-normalized LoG response. |
+| `stage1_maxima_neighborhoods` | list of positive integers | Voxel-unit local-maxima spacing for LoG or h-max recipes. |
+| `stage1_maxima_min_distances_nm` | list of positive numbers | Physical non-maximum-suppression distances in nanometers. |
+| `stage1_hmax_multipliers` | list of positive numbers | h-max prominence threshold as multiplier times image noise estimate. |
+| `stage1_hmax_sigma_mode` | `robust` or `std` | Noise estimate used for h-max thresholding. |
+| `stage1_smoothing_sigmas` | list of positive numbers plus optional `off` | 3D Gaussian smoothing sigmas in voxel units. |
+| `stage1_smoothing_sigmas_nm` | list of positive numbers plus optional `off` | 3D Gaussian smoothing sigmas in nanometers. |
+| `stage1_background_method` | `rolling_box_3d`, `slice_opening_2d`, `rolling_ball_2d`, or `rolling_ball_3d` | Background method swept when background radii are provided. |
+| `stage1_background_params` | list of positive numbers plus optional `off` | Background radii in voxel units. |
+| `stage1_background_params_nm` | list of positive numbers plus optional `off` | Background radii in nanometers. |
+
+Physical-unit fields use `pipeline_defaults.xy_spacing_nm` and `pipeline_defaults.z_spacing_nm` to convert nanometers to axis-specific voxel values.
+
+### Preflight Guardrails
+
+Guardrails are optional except `stage1_n_val_images`. If a guardrail value is `null` or absent, that guardrail is not used.
+
+| Key | Expected value | Meaning |
+|---|---|---|
+| `preflight.stage1_n_val_images` | positive integer or `all` | Number of validation images used for the fast Stage 1 screen. Stage 2 still uses the full `val/` split. |
+| `preflight.min_stage1_recall_mean` | number in `(0, 1]` or `null` | Minimum mean per-image Stage 1 recall. |
+| `preflight.max_stage1_candidates_mean` | positive number or `null` | Maximum mean candidates per preflight validation image. |
+| `preflight.max_stage1_candidates_single` | positive number or `null` | Maximum candidates allowed on any one preflight image. Also used as the preflight candidate-generation cap when set. |
+| `preflight.max_candidate_ratio_cap_mean` | positive number or `null` | Maximum mean per-image candidate/GT ratio, computed as `n_candidates / max(n_ground_truth, 1)` for each image and then averaged. |
+
+### Stage 1 Ranking
+
+| Key | Expected value | Meaning |
+|---|---|---|
+| `stage1_ranking.recall_tolerance` | number from `0` to `1` | Passing recipes within this recall distance of the best passing recipe remain eligible. Eligible recipes are ranked by higher mean Stage 1 F1, then recipe ID. |
+| `optimizer.shortlist_top_k` | positive integer | Number of Stage 1 recipes sent into Stage 2. |
+
+### Stage 2 Selection
+
+| Key | Expected value | Meaning |
+|---|---|---|
+| `optimizer.stage2_f1_tolerance` | number from `0` to `1` | Stage 2 recipes within this mean per-image validation F1 of the best recipe are considered near-ties. |
+| `optimizer.max_stage1_preflight_configs` | positive integer or `null` | Safety cap for total Stage 1 recipes. |
+| `optimizer.max_stage2_recipes_after_shortlist` | positive integer or `null` | Safety cap for Stage 2 feature-pack recipes after Stage 1 shortlisting. |
+
+Within the Stage 2 F1 near-tie band, SNAPpy chooses the simplest adequate model: simpler feature pack, Stage 1 pass-through before SVM when applicable, simpler SVM settings, better Stage 1 rank, then recipe ID.
+
+### Pipeline Defaults and Recipe Fields
+
+These fields can appear in `pipeline_defaults` and, when needed, inside explicit `stage1_recipes`.
+
+| Key | Expected value | Meaning |
+|---|---|---|
+| `xy_spacing_nm` | positive number | Physical xy pixel spacing. Required for optimization. |
+| `z_spacing_nm` | positive number | Physical z-step spacing. Required for optimization. |
+| `preproc_enabled` | `true` or `false` | Enables Stage 1 smoothing. |
+| `preproc_method` | `gaussian` or `none` | Smoothing method. |
+| `preproc_sigma` | positive number or `null` | Gaussian smoothing sigma in voxel units. |
+| `preproc_sigma_nm` | positive number or `null` | Gaussian smoothing sigma in nanometers. |
+| `norm_enabled` | `true` or `false` | Enables global intensity normalization. |
+| `norm_method` | `robust_z_score` or `none` | Normalization method. |
+| `background_enabled` | `true` or `false` | Enables background correction. |
+| `background_method` | supported background method | Background method for this recipe. |
+| `background_param` | positive number or `null` | Background radius in voxel units. |
+| `background_param_nm` | positive number or `null` | Background radius in nanometers. |
+| `background_clip` | `true` or `false` | Clip background-corrected negative values to zero. |
+| `maxima_method` | `log` or `h_max` | Candidate detector. |
+| `maxima_neighborhood` | positive integer or `null` | Voxel local-maximum spacing. |
+| `maxima_min_distance_nm` | positive number or `null` | Physical non-maximum-suppression distance. |
+| `sigma_value` | positive number or `null` | LoG sigma in voxel units. |
+| `sigma_nm` | positive number or `null` | LoG sigma in nanometers. |
+| `threshold_value` | number or `null` | LoG response threshold. |
+| `h_max_sigma_multiplier` | positive number or `null` | h-max prominence multiplier. |
+| `h_max_sigma_mode` | `robust` or `std` | h-max noise estimate. |
+| `fit_method` | `2D (XY) + 1D (Z) Gaussian`, `3D Gaussian`, or `Distorted 3D Gaussian` | Candidate fitting mode. |
+| `fit_window` | positive odd integer | Cubic fitting window size in voxels. |
+| `fit_background_width` | non-negative integer | Perimeter width used for local mean-background subtraction before fitting. |
+| `fit_max_iterations` | positive integer | Maximum nonlinear fit iterations. |
+| `fit_tolerance` | positive number | Nonlinear fit convergence tolerance. |
+| `selected_features` | list | Advanced explicit feature list. Most users should use `stage2_feature_packs` instead. |
+
+The default fitting mode is `2D (XY) + 1D (Z) Gaussian`. Explicit recipes can use aliases `xy_z_gaussian`, `gaussian_3d`, and `distorted_gaussian_3d`.
+
+### Stage 2 Feature Packs
+
+| Feature pack | Meaning |
+|---|---|
+| `core_fit` | Signal intensity, fitted sigma, and fit-quality features. |
+| `core_contrast` | `core_fit` plus local core/shell and half-space contrast features. |
+| `core_morphology` | `core_fit` plus object morphology and distorted-Gaussian covariance features when compatible. |
+| `full_interpretable` | Complete scalar interpretable feature set. |
+
+Feature packs are resolved by fitting mode. For example, distorted-Gaussian covariance features are used only with distorted 3D Gaussian fitting.
+
+### SVM Sweep
+
+| Key | Expected value | Meaning |
+|---|---|---|
+| `svm_sweep.kernels` | list containing `linear`, `rbf`, and/or `polynomial` | SVM kernels to test. |
+| `svm_sweep.box_constraints` | list of positive numbers | SVM `C` values. |
+| `svm_sweep.kernel_scales` | list containing `auto`, `scale`, or positive numbers | RBF/poly gamma values. `auto` means `1 / n_features`; `scale` means `1 / (n_features * feature_variance)`. |
+| `svm_sweep.polynomial_orders` | list of positive integers | Polynomial degrees. Used only for polynomial kernels. |
+| `svm_sweep.standardize` | `true` or `false` | Standardize features before SVM training. |
+| `svm_sweep.class_weighting` | `on` or `off` | `on` uses scikit-learn balanced class weights. |
+
+For every SVM setting, SNAPpy trains on `train/`, scores `val/`, and tunes one global decision threshold. Thresholds tested are `0.0`, `min(score) - 1e-6`, and validation-score quantiles at 1%, 5%, 10%, 15%, ..., 95%, and 99%. The threshold with highest mean per-image validation F1 wins; exact ties choose the threshold closest to `0.0`.
+
+### Runtime Cache
+
+These settings affect runtime only. They do not change model results.
+
+| Key | Expected value | Meaning |
+|---|---|---|
+| `runtime_cache.image_volume_cache_entries` | non-negative integer | Number of processed image volumes retained in memory. |
+| `runtime_cache.stage1_cache_enabled` | `true` or `false` | Enable Stage 1 candidate-coordinate cache. |
+| `runtime_cache.stage1_cache_entries` | non-negative integer | Candidate-coordinate cache size. During optimization, this cache is pruned to current Stage 1 leaders. |
+| `runtime_cache.fit_cache_enabled` | `true` or `false` | Enable Gaussian-fit/feature-table cache during Stage 2. |
+| `runtime_cache.fit_cache_entries` | non-negative integer | Fit/feature cache size. |
+
+SNAPpy caches in memory only. It does not create persistent cache files.
+
+### Advanced Dataset Profiling
+
+SNAPpy records a lightweight dataset profile in `model_config.json` and `model_summary.md`. Most users should keep the defaults.
+
+| Key | Expected value | Meaning |
+|---|---|---|
+| `profiling.enabled` | `true` or `false` | Enable the dataset profile summary. |
+| `profiling.train_image_count` | positive integer | Number of training images sampled for the profile. |
+| `profiling.val_image_count` | positive integer | Number of validation images sampled for the profile. |
+| `profiling.gt_intensity_radius` | non-negative integer | Radius used when sampling image intensity near ground-truth coordinates. |
+| `profiling.sparse_label_mean_max` | positive number | Mean labels/image at or below this value are marked sparse. |
+| `profiling.dense_label_mean_min` | positive number | Mean labels/image at or above this value are marked dense. |
+| `profiling.stage1_augmentation_enabled` | `true` or `false` | Add profile-guided Stage 1 recipes. Default is `false`. |
+| `profiling.apply_runtime_pruning_to_explicit_recipes` | `true` or `false` | Apply backend candidate-limit guidance to explicit recipes. Default is `false`. |
 
 ## Public Python API
 
-Core functions:
+```python
+init_config(output)
+optimize(config="default", dataset_root=None, out_dir=None, dataset_name=None)
+optimize_dry_run(config="default", dataset_root=None, out_dir=None, dataset_name=None)
+detect(model, input_path=None, input_list=None, output=None, config=None, score_threshold=None)
+```
 
-- `init_config(output)`
-- `optimize(config="default", train_dir=None, out_dir=None, dataset_name=None, match_distance=None, export_optimize_report=None, export_candidate_features=None)`
-- `optimize_dry_run(config="default", train_dir=None, out_dir=None, dataset_name=None, match_distance=None)`
-- `detect(model, input_path=None, input_list=None, output=None, config=None, score_threshold=None, export_candidate_features=False)`
-
-Lower-level modules remain available for development and testing, but they are
-not the public user workflow.
+Lower-level modules are available for development and testing, but they are not the recommended user workflow.
