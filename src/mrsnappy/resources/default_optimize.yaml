@@ -13,12 +13,13 @@ optimization_mode: fixed_split
 # Usually supplied by --dataset-root. In fixed_split mode, this folder contains train/ and val/.
 dataset_root: null
 
-# Candidate-to-ground-truth matching distance in voxel units.
-match_distance: 3.0
-
-# Optional alternative: use physical candidate-to-ground-truth matching in
-# nanometers. Do not set both match_distance and match_distance_nm.
-# match_distance_nm: 386.598
+# Candidate-to-ground-truth matching distance. The public default uses the same
+# physical-unit match radius planned for the ch1/ch2/ch3 publication benchmark.
+# Replace this value if a different tolerance is appropriate for your imaging
+# resolution and annotation precision. Do not set both match_distance and
+# match_distance_nm.
+match_distance: null
+match_distance_nm: 300.0
 
 # Stage 1 candidate generation.
 # Expected: log or hmax. To fully customize detection, replace this with an
@@ -28,29 +29,25 @@ match_distance: 3.0
 # Omitted list fields are treated as empty once a Stage 1 matrix is declared.
 stage1_detector_set: hmax
 
-# Voxel-space LoG and local-maximum sweep. Physical-unit fields can be added
-# alongside these to produce additional recipes:
-# stage1_log_sigmas_nm: [130.0, 200.0, 260.0]
-# stage1_maxima_min_distances_nm: [130.0, 260.0]
-stage1_log_sigmas: [1.0, 2.0, 3.0]
+# Physical-unit LoG and local-maximum sweep. These are mainly used if
+# stage1_detector_set is changed to log.
+stage1_log_sigmas_nm: [128.866, 257.732, 386.598]
 stage1_log_thresholds: [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0]
-stage1_maxima_neighborhoods: [1, 2]
+stage1_maxima_min_distances_nm: [128.866, 257.732]
 
 # Used when stage1_detector_set is hmax.
 stage1_hmax_multipliers: [0.1, 0.25, 0.5, 1.0, 1.5, 2.0]
 
-# 3D Gaussian smoothing sigmas in voxel units. The literal value off includes
-# an unsmoothed Stage 1 recipe. Add stage1_smoothing_sigmas_nm to sweep
-# physical-unit smoothing in addition to these voxel recipes.
-stage1_smoothing_sigmas: ["off", 0.5, 1.0, 2.0]
+# 3D Gaussian smoothing sigmas in nanometers. The literal value off includes
+# an unsmoothed Stage 1 recipe.
+stage1_smoothing_sigmas_nm: ["off", 64.433, 128.866, 257.732]
 
 # Expected: rolling_box_3d, slice_opening_2d, rolling_ball_2d, or rolling_ball_3d.
 stage1_background_method: rolling_box_3d
 
-# Background radii in voxel units. The literal value off includes recipes
-# without background correction. Add stage1_background_params_nm to sweep
-# physical-unit background radii in addition to these voxel recipes.
-stage1_background_params: ["off", 5.0, 10.0]
+# Background radii in nanometers. The literal value off includes recipes
+# without background correction.
+stage1_background_params_nm: ["off", 644.330, 1288.660]
 
 # Stage 1 pass/fail guardrails and ranking into Stage 2.
 preflight:
@@ -97,9 +94,17 @@ pipeline_defaults:
   # Required physical voxel spacing used by real-distance preprocessing,
   # physical matching, fitting-derived sigma features, and physical feature
   # measurements.
-  # Set these to the real pixel and z-step spacing for your microscope data.
-  xy_spacing_nm: null
-  z_spacing_nm: null
+  # These defaults match the ch1/ch2/ch3 publication benchmark geometry.
+  # Replace them with your microscope xy pixel spacing and z-step spacing.
+  xy_spacing_nm: 128.866
+  z_spacing_nm: 300.0
+  norm_enabled: true
+  norm_method: robust_z_score
+  fit_method: 2D (XY) + 1D (Z) Gaussian
+  fit_window: 7
+  fit_background_width: 1
+  fit_max_iterations: 200
+  fit_tolerance: 1.0e-06
 
 # Stage 2 model/feature tuning.
 # Expected entries: core_fit, core_contrast, core_morphology, full_interpretable.

@@ -194,7 +194,13 @@ Detection CSV columns:
 
 ## Config Reference
 
-The default config is the recommended starting point. Matrix fields are literal: if you provide a custom matrix list, SNAPpy sweeps only the values listed in your config.
+The default config is the recommended starting point and matches the SNAPpy
+publication benchmark geometry unless edited. It uses h-max candidate detection,
+physical-unit smoothing/background sweeps, `match_distance_nm: 300.0`, and
+default spacing values `xy_spacing_nm: 128.866` and `z_spacing_nm: 300.0`.
+Replace the spacing and match radius when your microscope geometry or annotation
+tolerance differs. Matrix fields are literal: if you provide a custom matrix
+list, SNAPpy sweeps only the values listed in your config.
 
 ### Top-Level Settings
 
@@ -204,7 +210,7 @@ The default config is the recommended starting point. Matrix fields are literal:
 | `dataset_root` | path or `null` | Usually supplied by `--dataset-root`; fixed-split root containing `train/` and `val/`. |
 | `optimization_mode` | `fixed_split` | Current implemented mode. Cross-validation is planned but not implemented. |
 | `match_distance` | positive number or `null` | Candidate-to-ground-truth matching radius in voxel units. Do not use with `match_distance_nm`. |
-| `match_distance_nm` | positive number or `null` | Candidate-to-ground-truth matching radius in nanometers. Requires `xy_spacing_nm` and `z_spacing_nm`. Do not use with `match_distance`. |
+| `match_distance_nm` | positive number or `null` | Candidate-to-ground-truth matching radius in nanometers. This is the default mode. Requires `xy_spacing_nm` and `z_spacing_nm`. Do not use with `match_distance`. |
 | `stage1_detector_set` | `hmax` or `log` | Built-in Stage 1 detector family to sweep. |
 | `stage1_recipes` | list of recipe mappings | Optional explicit Stage 1 recipes. If supplied, these replace the built-in detector-set matrix. |
 | `stage2_feature_packs` | list | Feature packs swept in Stage 2. Defaults to `core_fit`, `core_contrast`, `core_morphology`, and `full_interpretable`. |
@@ -228,7 +234,10 @@ Exactly one of `match_distance` or `match_distance_nm` must be set.
 | `stage1_background_params` | list of positive numbers plus optional `off` | Background radii in voxel units. |
 | `stage1_background_params_nm` | list of positive numbers plus optional `off` | Background radii in nanometers. |
 
-Physical-unit fields use `pipeline_defaults.xy_spacing_nm` and `pipeline_defaults.z_spacing_nm` to convert nanometers to axis-specific voxel values.
+Physical-unit fields use `pipeline_defaults.xy_spacing_nm` and
+`pipeline_defaults.z_spacing_nm` to convert nanometers to axis-specific voxel
+values. The shipped default config uses physical-unit Stage 1 fields; voxel-unit
+lists can still be used in custom configs.
 
 ### Preflight Guardrails
 

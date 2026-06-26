@@ -55,12 +55,16 @@ Create an editable config:
 mrsnappy init-config --output config.yaml
 ```
 
-Edit `config.yaml` and set:
+The default config is the benchmark-tested starting point used for the SNAPpy
+publication work: h-max candidate detection, physical-unit smoothing/background
+sweeps, a 300 nm candidate-to-label matching radius, and interpretable SVM
+feature packs. Before using it on other microscope data, confirm or replace the
+physical spacing values:
 
 ```yaml
 pipeline_defaults:
-  xy_spacing_nm: 128.866  # replace with your microscope xy pixel spacing
-  z_spacing_nm: 300.0     # replace with your microscope z-step spacing
+  xy_spacing_nm: 128.866  # replace if your xy pixel spacing differs
+  z_spacing_nm: 300.0     # replace if your z-step spacing differs
 ```
 
 Optimize a model from labeled training and validation images:

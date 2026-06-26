@@ -27,6 +27,12 @@ SNAPpy supports two candidate detectors:
 
 Voxel local-maxima spacing uses `maxima_neighborhood`. Physical local-maxima spacing uses `maxima_min_distance_nm`, which is applied after initial peak finding.
 
+The shipped default optimizer config follows the publication benchmark starting
+point: h-max detection, physical-unit local-maxima spacing, physical-unit
+smoothing/background sweeps, and a 300 nm candidate-to-label match radius. Users
+should replace the default `xy_spacing_nm` and `z_spacing_nm` values when their
+microscope geometry differs.
+
 Supported background methods:
 
 | Method | Meaning |

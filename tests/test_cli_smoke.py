@@ -66,7 +66,8 @@ def test_cli_init_config_writes_editable_default(tmp_path) -> None:
     assert "stage1_detector_set: hmax" in text
     assert "shortlist_top_k: 5" in text
     assert "runtime_cache:" in text
-    assert 'stage1_smoothing_sigmas: ["off", 0.5, 1.0, 2.0]' in text
+    assert 'stage1_smoothing_sigmas_nm: ["off", 64.433, 128.866, 257.732]' in text
+    assert "match_distance_nm: 300.0" in text
     assert "pipeline_defaults:" in text
     assert "xy_spacing_nm:" in text
     assert "z_spacing_nm:" in text
@@ -137,8 +138,10 @@ def test_load_config_resolves_packaged_default_template() -> None:
     cfg = load_config("default")
 
     assert cfg["dataset_name"] == "mrsnappy_dataset"
-    assert cfg["pipeline_defaults"]["xy_spacing_nm"] is None
-    assert cfg["pipeline_defaults"]["z_spacing_nm"] is None
+    assert cfg["pipeline_defaults"]["xy_spacing_nm"] == 128.866
+    assert cfg["pipeline_defaults"]["z_spacing_nm"] == 300.0
+    assert cfg["match_distance"] is None
+    assert cfg["match_distance_nm"] == 300.0
     assert cfg["svm_sweep"]["class_weighting"] == "on"
 
 

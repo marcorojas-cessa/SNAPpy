@@ -9,7 +9,7 @@ Install first:
 ```bash
 python -m pip install mrsnappy
 mrsnappy init-config --output config.yaml
-# Edit config.yaml and set pipeline_defaults.xy_spacing_nm and z_spacing_nm.
+# Confirm or replace pipeline_defaults.xy_spacing_nm and z_spacing_nm.
 mrsnappy optimize --dataset-root /path/to/labeled_dataset --out-dir /path/to/model --config config.yaml
 ```
 
