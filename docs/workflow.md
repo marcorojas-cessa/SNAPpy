@@ -85,21 +85,23 @@ Held-out test images should be scored outside SNAPpy after optimization.
 
 ### Stage 1 Screening
 
-SNAPpy evaluates Stage 1 recipes on `preflight.stage1_n_val_images` validation images. Guardrails are optional except for the validation-image count. A recipe may be rejected for low mean recall, too many candidates per image, too many candidates in one image, or too high a candidate/GT ratio.
+SNAPpy evaluates Stage 1 recipes on `preflight.stage1_n_val_images` validation images. Guardrails are optional except for the validation-image count. A recipe may be rejected for low mean recall on labeled images, too many candidates per image, too many candidates in one image, or too high a candidate/GT ratio.
 
-Candidate/GT ratio is computed per image:
+Recall and Stage 1 F1 are averaged only over preflight images with at least one ground-truth label, because recall is undefined when an image has no ground truth. Empty-GT images still count for candidate burden through `max_stage1_candidates_mean` and `max_stage1_candidates_single`.
+
+Candidate/GT ratio is computed per labeled image:
 
 ```text
-n_candidates / max(n_ground_truth, 1)
+n_candidates / n_ground_truth
 ```
 
-Then SNAPpy averages that ratio across the preflight validation images.
+Then SNAPpy averages that ratio across labeled preflight validation images.
 
 ### Stage 1 Ranking
 
 Passing Stage 1 recipes are ranked as follows:
 
-1. Find the best passing mean recall.
+1. Find the best passing mean recall on labeled validation images.
 2. Keep passing recipes within `stage1_ranking.recall_tolerance` of that recall.
 3. Rank those eligible recipes by higher mean Stage 1 F1.
 4. Break exact ties by recipe ID.
@@ -116,7 +118,7 @@ For every SVM setting:
 1. Fit the SVM on candidates from `train/`.
 2. Score candidates from all `val/` images.
 3. Tune one global decision threshold on `val/`.
-4. Record mean per-image F1, precision, and recall.
+4. Record mean per-image F1 and precision across all validation images, plus mean recall across labeled validation images.
 
 Thresholds tested are:
 

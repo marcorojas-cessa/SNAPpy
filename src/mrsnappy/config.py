@@ -33,7 +33,7 @@ DEFAULT_NATIVE_CONFIG: dict[str, Any] = {
     "stage1_log_thresholds": [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0],
     "stage1_maxima_neighborhoods": [1, 2],
     "stage1_maxima_min_distances_nm": [],
-    "stage1_hmax_multipliers": [0.1, 0.25, 0.5, 1.0, 1.5, 2.0],
+    "stage1_hmax_multipliers": [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0],
     "stage1_hmax_sigma_mode": "robust",
     "stage1_smoothing_sigmas": ["off", 0.5, 1.0, 2.0],
     "stage1_smoothing_sigmas_nm": [],
@@ -206,7 +206,7 @@ STAGE1_DETECTOR_PRESETS: dict[str, list[dict[str, Any]]] = {
         neighborhoods=[1, 2],
     ),
     "hmax": _hmax_stage1_grid(
-        multipliers=[0.1, 0.25, 0.5, 1.0, 1.5, 2.0],
+        multipliers=[0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0],
         neighborhoods=[1, 2],
         sigma_mode="robust",
     ),

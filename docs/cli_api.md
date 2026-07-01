@@ -246,16 +246,16 @@ Guardrails are optional except `stage1_n_val_images`. If a guardrail value is `n
 | Key | Expected value | Meaning |
 |---|---|---|
 | `preflight.stage1_n_val_images` | positive integer or `all` | Number of validation images used for the fast Stage 1 screen. Stage 2 still uses the full `val/` split. |
-| `preflight.min_stage1_recall_mean` | number in `(0, 1]` or `null` | Minimum mean per-image Stage 1 recall. |
+| `preflight.min_stage1_recall_mean` | number in `(0, 1]` or `null` | Minimum mean Stage 1 recall across labeled preflight images. Empty-GT images are excluded because recall is undefined there. |
 | `preflight.max_stage1_candidates_mean` | positive number or `null` | Maximum mean candidates per preflight validation image. |
 | `preflight.max_stage1_candidates_single` | positive number or `null` | Maximum candidates allowed on any one preflight image. Also used as the preflight candidate-generation cap when set. |
-| `preflight.max_candidate_ratio_cap_mean` | positive number or `null` | Maximum mean per-image candidate/GT ratio, computed as `n_candidates / max(n_ground_truth, 1)` for each image and then averaged. |
+| `preflight.max_candidate_ratio_cap_mean` | positive number or `null` | Maximum mean candidate/GT ratio, computed as `n_candidates / n_ground_truth` only on labeled preflight images. Empty-GT images still count for candidate mean and single-image caps. |
 
 ### Stage 1 Ranking
 
 | Key | Expected value | Meaning |
 |---|---|---|
-| `stage1_ranking.recall_tolerance` | number from `0` to `1` | Passing recipes within this recall distance of the best passing recipe remain eligible. Eligible recipes are ranked by higher mean Stage 1 F1, then recipe ID. |
+| `stage1_ranking.recall_tolerance` | number from `0` to `1` | Passing recipes within this labeled-image recall distance of the best passing recipe remain eligible. Eligible recipes are ranked by higher mean Stage 1 F1, then recipe ID. |
 | `optimizer.shortlist_top_k` | positive integer | Number of Stage 1 recipes sent into Stage 2. |
 
 ### Stage 2 Selection

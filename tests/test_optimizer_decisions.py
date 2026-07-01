@@ -34,7 +34,7 @@ def test_stage1_failure_reasons_are_explicit_and_minimal() -> None:
     )
 
     assert reasons == [
-        "mean recall 0.1000 < minimum 0.2500",
+        "mean recall on labeled images 0.1000 < minimum 0.2500",
         "mean candidates 3000.0 > maximum 2500.0",
         "single-image candidates 4500 > maximum 4000",
         "candidate/ground-truth ratio 101.00 > maximum 100.00",
@@ -161,6 +161,15 @@ def test_stage1_candidate_ratio_is_true_per_image_mean() -> None:
     assert _mean_per_image_candidate_ratio(image_rows) == pytest.approx(5.5)
 
 
+def test_stage1_candidate_ratio_ignores_empty_gt_images() -> None:
+    image_rows = [
+        {"n_candidates": 100, "n_labels": 100},
+        {"n_candidates": 5000, "n_labels": 0},
+    ]
+
+    assert _mean_per_image_candidate_ratio(image_rows) == pytest.approx(1.0)
+
+
 def test_null_preflight_guardrails_are_not_used() -> None:
     reasons = _stage1_failure_reasons(
         mean_recall=0.0,
@@ -182,6 +191,7 @@ def test_stage1_guardrail_progress_allows_recipes_that_can_still_pass() -> None:
     progress = _stage1_guardrail_progress(
         [{"n_candidates": 1000, "n_labels": 10, "recall": 0.0}],
         total_preflight_images=4,
+        total_labeled_preflight_images=4,
         preflight_cfg={
             "min_stage1_recall_mean": 0.25,
             "max_stage1_candidates_mean": 2500,
@@ -199,6 +209,7 @@ def test_stage1_guardrail_progress_stops_on_single_image_candidate_cap() -> None
     progress = _stage1_guardrail_progress(
         [{"n_candidates": 5001, "n_labels": 10, "recall": 1.0}],
         total_preflight_images=4,
+        total_labeled_preflight_images=4,
         preflight_cfg={
             "min_stage1_recall_mean": 0.25,
             "max_stage1_candidates_mean": 2500,
@@ -219,6 +230,7 @@ def test_stage1_guardrail_progress_stops_on_unrecoverable_mean_candidates() -> N
             {"n_candidates": 1, "n_labels": 10, "recall": 1.0},
         ],
         total_preflight_images=4,
+        total_labeled_preflight_images=4,
         preflight_cfg={
             "min_stage1_recall_mean": 0.25,
             "max_stage1_candidates_mean": 2500,
@@ -240,6 +252,7 @@ def test_stage1_guardrail_progress_stops_on_unrecoverable_mean_recall() -> None:
             {"n_candidates": 10, "n_labels": 10, "recall": 0.0},
         ],
         total_preflight_images=4,
+        total_labeled_preflight_images=4,
         preflight_cfg={
             "min_stage1_recall_mean": 0.75,
             "max_stage1_candidates_mean": 2500,
@@ -250,8 +263,28 @@ def test_stage1_guardrail_progress_stops_on_unrecoverable_mean_recall() -> None:
 
     assert not progress["can_still_pass"]
     assert progress["definitive_failure_reasons"] == [
-        "maximum possible mean recall 0.5000 < minimum 0.7500"
+        "maximum possible mean recall on labeled images 0.5000 < minimum 0.7500"
     ]
+
+
+def test_stage1_guardrail_progress_excludes_empty_gt_images_from_recall_ceiling() -> None:
+    progress = _stage1_guardrail_progress(
+        [
+            {"n_candidates": 0, "n_labels": 0, "recall": 0.0},
+            {"n_candidates": 0, "n_labels": 0, "recall": 0.0},
+        ],
+        total_preflight_images=3,
+        total_labeled_preflight_images=1,
+        preflight_cfg={
+            "min_stage1_recall_mean": 0.4,
+            "max_stage1_candidates_mean": 2500,
+            "max_stage1_candidates_single": 5000,
+            "max_candidate_ratio_cap_mean": 500.0,
+        },
+    )
+
+    assert progress["can_still_pass"]
+    assert progress["maximum_possible_mean_recall"] == pytest.approx(1.0)
 
 
 def test_stage1_guardrail_progress_stops_on_unrecoverable_candidate_ratio() -> None:
@@ -262,6 +295,7 @@ def test_stage1_guardrail_progress_stops_on_unrecoverable_candidate_ratio() -> N
             {"n_candidates": 1000, "n_labels": 10, "recall": 1.0},
         ],
         total_preflight_images=4,
+        total_labeled_preflight_images=4,
         preflight_cfg={
             "min_stage1_recall_mean": 0.25,
             "max_stage1_candidates_mean": 2500,
@@ -582,8 +616,8 @@ def test_optimizer_plan_counts_stage1_before_stage2_expansion(tmp_path) -> None:
 
     plan = optimizer_plan(config_path)
 
-    assert plan["stage1_recipe_bank_entries"] == 144
-    assert plan["unique_stage1_preflight_configs"] == 144
+    assert plan["stage1_recipe_bank_entries"] == 168
+    assert plan["unique_stage1_preflight_configs"] == 168
     assert plan["shortlist_top_k"] == 5
     assert plan["max_stage2_recipe_entries_after_shortlist"] == 20
     assert plan["svm_param_grid_entries_per_stage2_recipe"] == 48
@@ -592,7 +626,7 @@ def test_optimizer_plan_counts_stage1_before_stage2_expansion(tmp_path) -> None:
 def test_optimizer_plan_safety_stops_accidental_large_runs() -> None:
     cfg = {"optimizer": {"max_stage1_preflight_configs": 10, "max_stage2_recipes_after_shortlist": 20}}
     plan = {
-        "unique_stage1_preflight_configs": 144,
+        "unique_stage1_preflight_configs": 168,
         "max_stage2_recipe_entries_after_shortlist": 21,
     }
 

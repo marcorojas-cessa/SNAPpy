@@ -91,6 +91,27 @@ def test_stage2_selection_metrics_are_mean_per_image_with_pooled_audit_fields() 
     assert metrics["f1"] == pytest.approx(metrics["f1_mean_image"])
 
 
+def test_stage2_selection_metrics_handle_empty_gt_images_explicitly() -> None:
+    preds = {
+        "empty_clean": np.empty((0, 3), dtype=np.float32),
+        "empty_false_positive": np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        "labeled_hit": np.asarray([[5.0, 0.0, 0.0]], dtype=np.float32),
+    }
+    gts = {
+        "empty_clean": np.empty((0, 3), dtype=np.float32),
+        "empty_false_positive": np.empty((0, 3), dtype=np.float32),
+        "labeled_hit": np.asarray([[5.0, 0.0, 0.0]], dtype=np.float32),
+    }
+
+    metrics = pipeline.evaluate_predictions_for_selection(preds, gts, match_distance=0.1)
+
+    assert metrics["n_labeled_images"] == 1
+    assert metrics["n_empty_gt_images"] == 2
+    assert metrics["precision_mean_image"] == pytest.approx(2.0 / 3.0)
+    assert metrics["recall_mean_image"] == pytest.approx(1.0)
+    assert metrics["f1_mean_image"] == pytest.approx(2.0 / 3.0)
+
+
 def test_svm_threshold_tuning_breaks_f1_ties_by_threshold_closest_to_zero() -> None:
     preds = {"img": np.asarray([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=np.float32)}
     scores = {"img": np.asarray([-2.0, 2.0], dtype=np.float32)}

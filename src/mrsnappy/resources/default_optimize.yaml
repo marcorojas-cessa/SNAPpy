@@ -36,7 +36,7 @@ stage1_log_thresholds: [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0]
 stage1_maxima_min_distances_nm: [128.866, 257.732]
 
 # Used when stage1_detector_set is hmax.
-stage1_hmax_multipliers: [0.1, 0.25, 0.5, 1.0, 1.5, 2.0]
+stage1_hmax_multipliers: [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0]
 
 # 3D Gaussian smoothing sigmas in nanometers. The literal value off includes
 # an unsmoothed Stage 1 recipe.
@@ -56,8 +56,9 @@ preflight:
   # Stage 2 validation still uses the full val/ split.
   stage1_n_val_images: 5
 
-  # Minimum mean Stage 1 recall across preflight validation images required
-  # before a recipe can enter Stage 2.
+  # Minimum mean Stage 1 recall across labeled preflight validation images
+  # required before a recipe can enter Stage 2. Images with no GT labels are
+  # excluded from recall because recall is undefined there.
   min_stage1_recall_mean: 0.4
 
   # Maximum mean candidates per preflight image.
@@ -67,11 +68,12 @@ preflight:
   max_stage1_candidates_single: 5000
 
   # Candidate/GT ratio guardrail.
-  # The ratio is averaged per image as n_candidates / max(n_ground_truth, 1).
+  # The ratio is averaged per labeled image as n_candidates / n_ground_truth.
+  # Empty-GT images still count for candidate mean and single-image caps.
   max_candidate_ratio_cap_mean: 500.0
 
 stage1_ranking:
-  # Passing Stage 1 recipes within this mean-recall distance of the best
+  # Passing Stage 1 recipes within this labeled-image mean-recall distance of the best
   # passing recipe remain eligible for Stage 2 shortlisting. Eligible recipes
   # are ranked by higher mean Stage 1 F1, then deterministic recipe id.
   recall_tolerance: 0.05

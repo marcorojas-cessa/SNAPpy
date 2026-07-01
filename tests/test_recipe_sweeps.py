@@ -84,7 +84,7 @@ def test_default_hmax_sweeps_match_published_grid() -> None:
     hmax_mode = {str(recipe["h_max_sigma_mode"]) for recipe in recipes}
 
     assert {recipe["maxima_method"] for recipe in recipes} == {"h_max"}
-    assert hmax_multiplier == [0.1, 0.25, 0.5, 1.0, 1.5, 2.0]
+    assert hmax_multiplier == [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0]
     assert hmax_neighborhood == [1, 2]
     assert hmax_mode == {"robust"}
 
@@ -115,7 +115,7 @@ def test_default_sweep_has_unique_recipe_ids_and_expected_size() -> None:
     recipes = _default_recipe_bank()
     recipe_ids = [recipe["recipe_id"] for recipe in recipes]
 
-    assert len(recipes) == 144
+    assert len(recipes) == 168
     assert len(recipe_ids) == len(set(recipe_ids))
     assert len({recipe["stage1_dedup_key"] for recipe in recipes}) == len(recipes)
 
@@ -160,7 +160,7 @@ def test_stage1_recipe_bank_deduplicates_equivalent_candidate_generation_configs
 def test_stage1_detector_presets_are_log_or_hmax_only() -> None:
     assert sorted(STAGE1_DETECTOR_PRESETS) == ["hmax", "log"]
     assert len(STAGE1_DETECTOR_PRESETS["log"]) == 42
-    assert len(STAGE1_DETECTOR_PRESETS["hmax"]) == 12
+    assert len(STAGE1_DETECTOR_PRESETS["hmax"]) == 14
 
 
 def test_hmax_detector_set_uses_explicit_matrix_values(tmp_path) -> None:

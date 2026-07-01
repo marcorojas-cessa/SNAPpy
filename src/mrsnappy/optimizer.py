@@ -284,17 +284,28 @@ def _stage1_ranking_config(ranking_cfg: dict[str, Any] | None) -> dict[str, Any]
 
 
 def _mean_per_image_candidate_ratio(image_rows: list[dict[str, Any]]) -> float:
-    """Average per-image candidate burden as candidates divided by ground-truth labels."""
+    """Average candidate burden on images where candidate/GT ratio is defined."""
+    labeled_rows = [row for row in image_rows if int(row.get("n_labels", 0)) > 0]
+    if not labeled_rows:
+        return 0.0
     return float(
-        sum(float(row["n_candidates"]) / max(float(row["n_labels"]), 1.0) for row in image_rows)
-        / max(len(image_rows), 1)
+        sum(float(row["n_candidates"]) / float(row["n_labels"]) for row in labeled_rows)
+        / len(labeled_rows)
     )
+
+
+def _mean_labeled_stage1_metric(image_rows: list[dict[str, Any]], metric_name: str) -> float:
+    labeled_rows = [row for row in image_rows if int(row.get("n_labels", 0)) > 0]
+    if not labeled_rows:
+        return 0.0
+    return float(sum(float(row[metric_name]) for row in labeled_rows) / len(labeled_rows))
 
 
 def _stage1_guardrail_progress(
     image_rows: list[dict[str, Any]],
     *,
     total_preflight_images: int,
+    total_labeled_preflight_images: int,
     preflight_cfg: dict[str, Any],
 ) -> dict[str, Any]:
     """Determine whether a Stage 1 recipe can still pass the configured guardrails.
@@ -305,10 +316,19 @@ def _stage1_guardrail_progress(
     processed_image_count = int(len(image_rows))
     total_image_count = max(int(total_preflight_images), 1)
     remaining_image_count = max(total_image_count - processed_image_count, 0)
+    total_labeled_image_count = max(int(total_labeled_preflight_images), 0)
+    processed_labeled_image_count = int(sum(1 for row in image_rows if int(row.get("n_labels", 0)) > 0))
+    remaining_labeled_image_count = max(total_labeled_image_count - processed_labeled_image_count, 0)
     candidate_count_so_far = float(sum(float(row["n_candidates"]) for row in image_rows))
-    recall_sum_so_far = float(sum(float(row["recall"]) for row in image_rows))
+    recall_sum_so_far = float(
+        sum(float(row["recall"]) for row in image_rows if int(row.get("n_labels", 0)) > 0)
+    )
     candidate_ratio_sum_so_far = float(
-        sum(float(row["n_candidates"]) / max(float(row["n_labels"]), 1.0) for row in image_rows)
+        sum(
+            float(row["n_candidates"]) / float(row["n_labels"])
+            for row in image_rows
+            if int(row.get("n_labels", 0)) > 0
+        )
     )
     max_candidates_so_far = int(max((int(row["n_candidates"]) for row in image_rows), default=0))
 
@@ -317,9 +337,17 @@ def _stage1_guardrail_progress(
     max_single_candidates = preflight_cfg.get("max_stage1_candidates_single")
     ratio_cap = _active_candidate_ratio_cap(preflight_cfg)
 
-    maximum_possible_mean_recall = float((recall_sum_so_far + remaining_image_count) / total_image_count)
+    maximum_possible_mean_recall = (
+        float((recall_sum_so_far + remaining_labeled_image_count) / total_labeled_image_count)
+        if total_labeled_image_count
+        else None
+    )
     minimum_possible_mean_candidates = float(candidate_count_so_far / total_image_count)
-    minimum_possible_candidate_ratio = float(candidate_ratio_sum_so_far / total_image_count)
+    minimum_possible_candidate_ratio = (
+        float(candidate_ratio_sum_so_far / total_labeled_image_count)
+        if total_labeled_image_count
+        else 0.0
+    )
 
     definitive_failure_reasons: list[str] = []
     if max_single_candidates is not None and max_candidates_so_far > float(max_single_candidates):
@@ -331,9 +359,9 @@ def _stage1_guardrail_progress(
             "minimum possible mean candidates "
             f"{minimum_possible_mean_candidates:.1f} > maximum {float(max_mean_candidates):.1f}"
         )
-    if min_recall is not None and maximum_possible_mean_recall < float(min_recall):
+    if min_recall is not None and maximum_possible_mean_recall is not None and maximum_possible_mean_recall < float(min_recall):
         definitive_failure_reasons.append(
-            "maximum possible mean recall "
+            "maximum possible mean recall on labeled images "
             f"{maximum_possible_mean_recall:.4f} < minimum {float(min_recall):.4f}"
         )
     if ratio_cap is not None and minimum_possible_candidate_ratio > float(ratio_cap):
@@ -348,6 +376,9 @@ def _stage1_guardrail_progress(
         "processed_image_count": processed_image_count,
         "total_image_count": total_image_count,
         "remaining_image_count": remaining_image_count,
+        "processed_labeled_image_count": processed_labeled_image_count,
+        "total_labeled_image_count": total_labeled_image_count,
+        "remaining_labeled_image_count": remaining_labeled_image_count,
         "maximum_possible_mean_recall": maximum_possible_mean_recall,
         "minimum_possible_mean_candidates": minimum_possible_mean_candidates,
         "minimum_possible_candidate_ratio": minimum_possible_candidate_ratio,
@@ -358,7 +389,7 @@ def _stage1_ranked_passed_df(passed_df: pd.DataFrame, ranking_cfg: dict[str, Any
     """Rank passing Stage 1 recipes by the finalized recall-band/F1 policy.
 
     Guardrails have already been applied before this function is called.
-    Only recipes within recall_tolerance of the best passing mean recall are
+    Only recipes within recall_tolerance of the best passing labeled-image mean recall are
     ranked for Stage 2 consideration. Recipes outside that recall band are
     retained for audit output but are not eligible for Stage 2 shortlisting.
     """
@@ -513,6 +544,11 @@ def _evaluate_full_val_stage1(passed_df: pd.DataFrame, cfg: dict[str, Any], val_
         metrics = precision_recall_f1(total_tp, total_fp, total_fn)
         total_candidates = int(sum(image_row["n_candidates"] for image_row in image_rows))
         total_labels = int(sum(image_row["n_labels"] for image_row in image_rows))
+        stage1_full_val_candidate_ratio = (
+            float(total_candidates / total_labels)
+            if total_labels > 0
+            else None
+        )
         rows.append(
             {
                 "recipe_id": str(row["recipe_id"]),
@@ -525,7 +561,7 @@ def _evaluate_full_val_stage1(passed_df: pd.DataFrame, cfg: dict[str, Any], val_
                 "stage1_full_val_f1": float(metrics["f1"]),
                 "stage1_full_val_mean_tp": float(total_tp / max(n_images, 1)),
                 "stage1_full_val_mean_candidates": float(total_candidates / max(n_images, 1)),
-                "stage1_full_val_candidate_ratio": float(total_candidates / max(total_labels, 1)),
+                "stage1_full_val_candidate_ratio": stage1_full_val_candidate_ratio,
                 "mean_stage1_candidate_ratio": float(row.get("mean_stage1_candidate_ratio", float("inf"))),
                 "recipe": recipe,
             }
@@ -537,7 +573,9 @@ def _ensure_preflight_sort_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if "mean_stage1_candidate_ratio" not in out:
         if {"mean_stage1_candidates", "mean_stage1_label_count"}.issubset(out.columns):
-            out["mean_stage1_candidate_ratio"] = out["mean_stage1_candidates"].astype(float) / out["mean_stage1_label_count"].astype(float).clip(lower=1.0)
+            labels = out["mean_stage1_label_count"].astype(float)
+            candidates = out["mean_stage1_candidates"].astype(float)
+            out["mean_stage1_candidate_ratio"] = np.where(labels > 0.0, candidates / labels, np.inf)
         else:
             out["mean_stage1_candidate_ratio"] = float("inf")
     if "mean_stage1_f1" not in out:
@@ -691,8 +729,8 @@ def _optimizer_plan_from_materialized(
         "execution_order": [
             "evaluate unique Stage 1 candidate-generation configurations only",
             "apply only the Stage 1 guardrails explicitly configured by the user",
-            "keep passing Stage 1 configurations within the recall tolerance of best mean recall",
-            "rank recall-eligible Stage 1 configurations by higher mean F1, then deterministic id",
+            "keep passing Stage 1 configurations within the recall tolerance of best labeled-image mean recall",
+            "rank recall-eligible Stage 1 configurations by higher labeled-image mean F1, then deterministic id",
             "shortlist Stage 1 configurations",
             "expand shortlisted Stage 1 configurations into Stage 2 feature-pack/fit recipes",
             "train/evaluate Stage 2 recipes and choose final winner",
@@ -748,7 +786,7 @@ def _stage1_failure_reasons(
     max_single_candidates = preflight_cfg.get("max_stage1_candidates_single")
     ratio_cap = _active_candidate_ratio_cap(preflight_cfg)
     if min_recall is not None and float(mean_recall) < float(min_recall):
-        reasons.append(f"mean recall {float(mean_recall):.4f} < minimum {float(min_recall):.4f}")
+        reasons.append(f"mean recall on labeled images {float(mean_recall):.4f} < minimum {float(min_recall):.4f}")
     if max_mean_candidates is not None and float(mean_candidates) > float(max_mean_candidates):
         reasons.append(f"mean candidates {float(mean_candidates):.1f} > maximum {float(max_mean_candidates):.1f}")
     if max_single_candidates is not None and int(max_candidates) > float(max_single_candidates):
@@ -851,6 +889,125 @@ def _json_ready(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_json_ready(val) for val in value]
     return _json_scalar(value)
+
+
+def _stage1_preflight_recipe_table(preflight_df: pd.DataFrame) -> pd.DataFrame:
+    """Compact recipe-level Stage 1 preflight diagnostics for terminal failures."""
+    if preflight_df.empty:
+        return pd.DataFrame()
+    columns = [
+        "recipe_id",
+        "passed",
+        "stage1_decision",
+        "stage1_stopped_early",
+        "stage1_early_stop_reason",
+        "stage1_preflight_images_processed",
+        "stage1_preflight_images_total",
+        "stage1_labeled_preflight_images_processed",
+        "stage1_labeled_preflight_images_total",
+        "stage1_empty_gt_preflight_images_processed",
+        "stage1_empty_gt_preflight_images_total",
+        "mean_stage1_recall",
+        "mean_stage1_precision",
+        "mean_stage1_f1",
+        "total_stage1_tp",
+        "total_stage1_fp",
+        "total_stage1_fn",
+        "mean_stage1_candidates",
+        "mean_stage1_label_count",
+        "mean_stage1_candidate_ratio",
+        "max_stage1_candidates",
+        "stage1_maximum_possible_mean_recall",
+        "stage1_minimum_possible_mean_candidates",
+        "stage1_minimum_possible_candidate_ratio",
+        "stage2_recipe_count",
+    ]
+    rows: list[dict[str, Any]] = []
+    for _, row in preflight_df.iterrows():
+        record = {column: _json_scalar(row[column]) for column in columns if column in row.index}
+        recipe = dict(row.get("recipe", {}))
+        for key in _STAGE1_SCREEN_FIELDS:
+            if key in recipe:
+                record[key] = _json_ready(recipe.get(key))
+        rows.append(record)
+    return pd.DataFrame(rows)
+
+
+def _stage1_preflight_failure_records(
+    preflight_df: pd.DataFrame,
+    *,
+    sort_columns: list[str],
+    top_n: int,
+) -> list[dict[str, Any]]:
+    if preflight_df.empty:
+        return []
+    table = _stage1_preflight_recipe_table(preflight_df)
+    if table.empty:
+        return []
+    descending_columns = {"mean_stage1_f1", "mean_stage1_recall", "mean_stage1_precision"}
+    ascending = [column not in descending_columns for column in sort_columns]
+    table = table.sort_values(sort_columns, ascending=ascending).head(int(top_n))
+    return [_json_ready(record) for record in table.to_dict(orient="records")]
+
+
+def _write_stage1_preflight_failure_outputs(
+    run_dir: Path,
+    *,
+    preflight_df: pd.DataFrame,
+    cfg: dict[str, Any],
+    status: str,
+    message: str,
+) -> dict[str, Any]:
+    """Write compact Stage 1 diagnostics before deleting raw optimizer progress logs."""
+    recipe_table = _stage1_preflight_recipe_table(preflight_df)
+    recipe_csv_path = run_dir / "stage1_preflight_failure_recipes.csv"
+    recipe_table.to_csv(recipe_csv_path, index=False)
+    decision_counts = (
+        preflight_df["stage1_decision"].fillna("unknown").astype(str).value_counts().to_dict()
+        if "stage1_decision" in preflight_df
+        else {}
+    )
+    summary = {
+        "schema": "mrsnappy_stage1_preflight_failure_summary_v1",
+        "status": status,
+        "message": message,
+        "purpose": (
+            "Compact diagnostics for optimization runs that stopped before Stage 2 "
+            "because no Stage 1 recipe passed the configured preflight guardrails."
+        ),
+        "recipe_count": int(len(preflight_df)),
+        "passed_recipe_count": int(preflight_df["passed"].sum()) if "passed" in preflight_df else 0,
+        "failed_recipe_count": (
+            int((~preflight_df["passed"].astype(bool)).sum())
+            if "passed" in preflight_df
+            else int(len(preflight_df))
+        ),
+        "guardrails": _json_ready(cfg.get("preflight", {})),
+        "decision_counts": {str(key): int(value) for key, value in decision_counts.items()},
+        "top_recipes_by_stage1_f1": _stage1_preflight_failure_records(
+            preflight_df,
+            sort_columns=["mean_stage1_f1", "mean_stage1_recall", "recipe_id"],
+            top_n=10,
+        ),
+        "lowest_candidate_ratio_recipes": _stage1_preflight_failure_records(
+            preflight_df,
+            sort_columns=["mean_stage1_candidate_ratio", "mean_stage1_f1", "recipe_id"],
+            top_n=10,
+        ),
+        "output_files": {
+            "stage1_preflight_failure_summary": "stage1_preflight_failure_summary.json",
+            "stage1_preflight_failure_recipes": "stage1_preflight_failure_recipes.csv",
+        },
+    }
+    summary_path = run_dir / "stage1_preflight_failure_summary.json"
+    write_json(summary_path, _json_ready(summary))
+    return {
+        "summary": summary,
+        "output_files": {
+            "stage1_preflight_failure_summary": summary["output_files"]["stage1_preflight_failure_summary"],
+            "stage1_preflight_failure_recipes": summary["output_files"]["stage1_preflight_failure_recipes"],
+        },
+    }
 
 
 def _stage1_score_payload(winner: pd.Series) -> dict[str, Any]:
@@ -1045,8 +1202,8 @@ def _stage1_ranking_summary(cfg: dict[str, Any]) -> dict[str, Any]:
         "shortlist_top_k": int(cfg["optimizer"]["shortlist_top_k"]),
         "ranking_order": [
             "apply configured Stage 1 guardrails",
-            "keep passing recipes with mean recall within recall_tolerance of the best passing recipe",
-            "rank recall-eligible recipes by higher mean Stage 1 F1",
+            "keep passing recipes with labeled-image mean recall within recall_tolerance of the best passing recipe",
+            "rank recall-eligible recipes by higher labeled-image mean Stage 1 F1",
             "break exact ties by recipe_id",
             "send the top shortlist_top_k unique Stage 1 configurations to Stage 2",
         ],
@@ -1148,7 +1305,7 @@ def _summary_markdown_lines(
         "## Stage 1 Guardrails",
         f"- Preflight validation images requested: `{stage1_guardrails['stage1_n_val_images_requested']}`",
         f"- Preflight validation images used: `{stage1_guardrails['stage1_n_val_images_used']}` of `{stage1_guardrails['available_validation_image_count']}` available validation images.",
-        f"- Minimum mean recall: `{_format_summary_value(stage1_guardrails['min_stage1_recall_mean'])}`",
+        f"- Minimum mean recall on labeled images: `{_format_summary_value(stage1_guardrails['min_stage1_recall_mean'])}`",
         f"- Maximum mean candidates per image: `{_format_summary_value(stage1_guardrails['max_stage1_candidates_mean'], digits=1)}`",
         f"- Maximum candidates in a single image: `{_format_summary_value(stage1_guardrails['max_stage1_candidates_single'], digits=1)}`",
         f"- Maximum mean candidate/GT ratio: `{_format_summary_value(stage1_guardrails['max_candidate_ratio_cap_mean'], digits=2)}`",
@@ -1296,6 +1453,8 @@ def _write_terminal_model_outputs(
     requested_preflight_image_count: int | str | None = None,
     preflight_image_count: int = 0,
     available_validation_image_count: int = 0,
+    extra_output_files: dict[str, str] | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> Path:
     model_summary_path = run_dir / "model_summary.md"
     model_config_path = run_dir / "model_config.json"
@@ -1309,37 +1468,56 @@ def _write_terminal_model_outputs(
         if "preflight" in cfg
         else {}
     )
+    output_files = {
+        "model_config": "model_config.json",
+        "model_summary": "model_summary.md",
+        "optimization_splits": "optimization_splits.csv",
+    }
+    if extra_output_files:
+        output_files.update(extra_output_files)
+    payload = {
+        "schema": "mrsnappy_model_config_v1",
+        "purpose": "SNAPpy optimization terminal record. No usable model.joblib was produced.",
+        "status": status,
+        "message": message,
+        "dataset_name": cfg.get("dataset_name"),
+        "optimization_mode": mode,
+        "validation_strategy": "fixed user-supplied train/ and val/ folders",
+        "output_files": output_files,
+        "effective_config": _json_ready(cfg),
+        "dataset_profile": _json_ready(profile),
+        "optimizer_plan": _json_ready(optimizer_plan_payload),
+        "optimization_split_summary": split_summary,
+        "stage1": {
+            "guardrails": stage1_guardrails,
+            "ranking": _stage1_ranking_summary(cfg) if "stage1_ranking" in cfg else {},
+        },
+    }
+    if diagnostics:
+        payload["diagnostics"] = _json_ready(diagnostics)
     write_json(
         model_config_path,
-        {
-            "schema": "mrsnappy_model_config_v1",
-            "purpose": "SNAPpy optimization terminal record. No usable model.joblib was produced.",
-            "status": status,
-            "message": message,
-            "dataset_name": cfg.get("dataset_name"),
-            "optimization_mode": mode,
-            "validation_strategy": "fixed user-supplied train/ and val/ folders",
-            "output_files": {
-                "model_config": "model_config.json",
-                "model_summary": "model_summary.md",
-                "optimization_splits": "optimization_splits.csv",
-            },
-            "effective_config": _json_ready(cfg),
-            "dataset_profile": _json_ready(profile),
-            "optimizer_plan": _json_ready(optimizer_plan_payload),
-            "optimization_split_summary": split_summary,
-            "stage1": {
-                "guardrails": stage1_guardrails,
-                "ranking": _stage1_ranking_summary(cfg) if "stage1_ranking" in cfg else {},
-            },
-        },
+        payload,
     )
-    model_summary_path.write_text(
-        "# SNAPpy Optimizer\n\n"
-        f"Status: `{status}`\n\n"
-        f"{message}\n\n"
-        "No `model.joblib` was produced.\n",
-    )
+    lines = [
+        "# SNAPpy Optimizer",
+        "",
+        f"Status: `{status}`",
+        "",
+        message,
+        "",
+        "No `model.joblib` was produced.",
+    ]
+    if extra_output_files:
+        lines.extend(
+            [
+                "",
+                "## Diagnostic Outputs",
+                "",
+                *[f"- `{name}`: `{filename}`" for name, filename in sorted(extra_output_files.items())],
+            ]
+        )
+    model_summary_path.write_text("\n".join(lines) + "\n")
     return model_summary_path
 
 
@@ -1652,6 +1830,15 @@ def optimize_native_dataset(
     else:
         requested_preflight_image_count = int(requested_preflight_images)
         val_pairs = all_val_pairs[: min(requested_preflight_image_count, len(all_val_pairs))]
+    preflight_label_counts = [int(len(read_points_csv(label_path))) for _, label_path in val_pairs]
+    labeled_preflight_image_count = int(sum(1 for count in preflight_label_counts if count > 0))
+    empty_gt_preflight_image_count = int(len(preflight_label_counts) - labeled_preflight_image_count)
+    if cfg["preflight"].get("min_stage1_recall_mean") is not None and labeled_preflight_image_count == 0:
+        raise ValueError(
+            "preflight.min_stage1_recall_mean requires at least one selected preflight validation image "
+            "with ground-truth labels. Use more validation images, set stage1_n_val_images='all', "
+            "or disable the recall guardrail by setting it to null."
+        )
     min_stage1_cache_entries = max(1, int(cfg["optimizer"]["shortlist_top_k"]) * max(len(all_val_pairs), len(val_pairs), 1))
     current_stage1_cache_entries = int(cfg.get("pipeline_defaults", {}).get("stage1_cache_entries", 0))
     if current_stage1_cache_entries < min_stage1_cache_entries:
@@ -1673,6 +1860,8 @@ def optimize_native_dataset(
             "stage1_recipe_count": int(len(stage1_recipes)),
             "requested_preflight_image_count": requested_preflight_image_count,
             "preflight_image_count": int(len(val_pairs)),
+            "labeled_preflight_image_count": labeled_preflight_image_count,
+            "empty_gt_preflight_image_count": empty_gt_preflight_image_count,
             "available_validation_image_count": int(len(all_val_pairs)),
             "dataset_name": cfg["dataset_name"],
         },
@@ -1698,6 +1887,7 @@ def optimize_native_dataset(
             guardrail_progress = _stage1_guardrail_progress(
                 image_rows,
                 total_preflight_images=len(val_pairs),
+                total_labeled_preflight_images=labeled_preflight_image_count,
                 preflight_cfg=cfg["preflight"],
             )
             if not guardrail_progress["can_still_pass"]:
@@ -1706,9 +1896,9 @@ def optimize_native_dataset(
                 break
         mean_candidates = float(sum(row["n_candidates"] for row in image_rows) / max(len(image_rows), 1))
         mean_labels = float(sum(row["n_labels"] for row in image_rows) / max(len(image_rows), 1))
-        mean_recall = float(sum(row["recall"] for row in image_rows) / max(len(image_rows), 1))
-        mean_precision = float(sum(row["precision"] for row in image_rows) / max(len(image_rows), 1))
-        mean_f1 = float(sum(row["f1"] for row in image_rows) / max(len(image_rows), 1))
+        mean_recall = _mean_labeled_stage1_metric(image_rows, "recall")
+        mean_precision = _mean_labeled_stage1_metric(image_rows, "precision")
+        mean_f1 = _mean_labeled_stage1_metric(image_rows, "f1")
         max_candidates = int(max((row["n_candidates"] for row in image_rows), default=0))
         mean_candidate_ratio = _mean_per_image_candidate_ratio(image_rows)
         total_tp = int(sum(row["tp"] for row in image_rows))
@@ -1728,6 +1918,8 @@ def optimize_native_dataset(
         passed = not failure_reasons
         processed_image_count = int(len(image_rows))
         total_preflight_image_count = int(len(val_pairs))
+        processed_labeled_image_count = int(sum(1 for row in image_rows if int(row.get("n_labels", 0)) > 0))
+        processed_empty_gt_image_count = int(processed_image_count - processed_labeled_image_count)
         early_stop_reason = _preflight_pass_label(early_stop_reasons) if stopped_early else None
         preflight_rows.append(
             {
@@ -1751,6 +1943,10 @@ def optimize_native_dataset(
                 "stage1_early_stop_reason": early_stop_reason,
                 "stage1_preflight_images_processed": processed_image_count,
                 "stage1_preflight_images_total": total_preflight_image_count,
+                "stage1_labeled_preflight_images_processed": processed_labeled_image_count,
+                "stage1_labeled_preflight_images_total": labeled_preflight_image_count,
+                "stage1_empty_gt_preflight_images_processed": processed_empty_gt_image_count,
+                "stage1_empty_gt_preflight_images_total": empty_gt_preflight_image_count,
                 "stage1_maximum_possible_mean_recall": (
                     early_stop_progress["maximum_possible_mean_recall"] if early_stop_progress else None
                 ),
@@ -1781,6 +1977,10 @@ def optimize_native_dataset(
                 "stage1_early_stop_reason": early_stop_reason,
                 "stage1_preflight_images_processed": processed_image_count,
                 "stage1_preflight_images_total": total_preflight_image_count,
+                "stage1_labeled_preflight_images_processed": processed_labeled_image_count,
+                "stage1_labeled_preflight_images_total": labeled_preflight_image_count,
+                "stage1_empty_gt_preflight_images_processed": processed_empty_gt_image_count,
+                "stage1_empty_gt_preflight_images_total": empty_gt_preflight_image_count,
                 "stage1_candidate_cache_pruned_entries": int(pruned_stage1_cache_entries),
             },
         )
@@ -1796,6 +1996,13 @@ def optimize_native_dataset(
     passed_df = preflight_df[preflight_df["passed"]].copy()
     if passed_df.empty:
         preflight_df = _apply_preflight_decision_columns(preflight_df, ranking_cfg=cfg["stage1_ranking"])
+        preflight_diagnostics = _write_stage1_preflight_failure_outputs(
+            run_dir,
+            preflight_df=preflight_df,
+            cfg=cfg,
+            status="no_preflight_survivors",
+            message="No recipes passed Stage 1 preflight.",
+        )
         summary_path = _write_terminal_model_outputs(
             run_dir,
             cfg=cfg,
@@ -1808,6 +2015,8 @@ def optimize_native_dataset(
             requested_preflight_image_count=requested_preflight_image_count,
             preflight_image_count=len(val_pairs),
             available_validation_image_count=len(all_val_pairs),
+            extra_output_files=preflight_diagnostics["output_files"],
+            diagnostics=preflight_diagnostics["summary"],
         )
         _remove_optimizer_progress_files(run_dir)
         return summary_path

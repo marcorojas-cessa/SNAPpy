@@ -221,6 +221,29 @@ def precision_recall_f1(tp: int, fp: int, fn: int) -> dict[str, float]:
     return {"precision": precision, "recall": recall, "f1": f1}
 
 
+def _image_selection_metrics(tp: int, fp: int, fn: int) -> dict[str, float | bool]:
+    """Per-image validation metrics with explicit empty-GT handling.
+
+    Empty-GT images do not have defined recall. They contribute F1=1 only
+    when there are no detections, and F1=0 when any false positives are present.
+    """
+    gt_count = int(tp + fn)
+    pred_count = int(tp + fp)
+    has_gt = gt_count > 0
+    if not has_gt:
+        no_false_positive = int(fp) == 0
+        return {
+            "precision": 1.0 if no_false_positive else 0.0,
+            "recall": 0.0,
+            "recall_defined": False,
+            "f1": 1.0 if no_false_positive else 0.0,
+        }
+    precision = float(tp / pred_count) if pred_count else 0.0
+    recall = float(tp / gt_count)
+    f1 = float(2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+    return {"precision": precision, "recall": recall, "recall_defined": True, "f1": f1}
+
+
 def _stage1_signature(pipeline_cfg: dict[str, Any]) -> str:
     payload = {key: pipeline_cfg.get(key) for key in _STAGE1_KEY_FIELDS}
     encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
@@ -1162,10 +1185,15 @@ def evaluate_predictions_for_selection(
     gts: dict[str, np.ndarray],
     match_distance: float,
     match_spacing_nm: tuple[float, ...] | None = None,
-) -> dict[str, float]:
-    """Evaluate detections with image-mean metrics as the Stage 2 selection target."""
+) -> dict[str, float | int]:
+    """Evaluate detections with image-mean metrics as the Stage 2 selection target.
+
+    Recall is averaged only over images with at least one ground-truth point.
+    Empty-GT images still affect F1 and precision: no detections is counted as
+    correct absence, while any detections are false positives.
+    """
     totals = {"tp": 0, "fp": 0, "fn": 0}
-    per_image_metrics: list[dict[str, float]] = []
+    per_image_metrics: list[dict[str, float | bool]] = []
     for key in sorted(gts):
         pred = preds.get(key, np.empty((0, 3), dtype=np.float32))
         gt = gts[key]
@@ -1173,14 +1201,19 @@ def evaluate_predictions_for_selection(
         totals["tp"] += tp
         totals["fp"] += fp
         totals["fn"] += fn
-        metrics = precision_recall_f1(tp, fp, fn)
+        metrics = _image_selection_metrics(tp, fp, fn)
         per_image_metrics.append(metrics)
 
     pooled = precision_recall_f1(totals["tp"], totals["fp"], totals["fn"])
     n_images = max(len(per_image_metrics), 1)
-    precision_mean_image = float(sum(row["precision"] for row in per_image_metrics) / n_images)
-    recall_mean_image = float(sum(row["recall"] for row in per_image_metrics) / n_images)
-    f1_mean_image = float(sum(row["f1"] for row in per_image_metrics) / n_images)
+    recall_rows = [row for row in per_image_metrics if bool(row["recall_defined"])]
+    precision_mean_image = float(sum(float(row["precision"]) for row in per_image_metrics) / n_images)
+    recall_mean_image = (
+        float(sum(float(row["recall"]) for row in recall_rows) / len(recall_rows))
+        if recall_rows
+        else 0.0
+    )
+    f1_mean_image = float(sum(float(row["f1"]) for row in per_image_metrics) / n_images)
     return {
         "tp": int(totals["tp"]),
         "fp": int(totals["fp"]),
@@ -1195,6 +1228,8 @@ def evaluate_predictions_for_selection(
         "recall_pooled": pooled["recall"],
         "f1_pooled": pooled["f1"],
         "n_images": int(len(per_image_metrics)),
+        "n_labeled_images": int(len(recall_rows)),
+        "n_empty_gt_images": int(len(per_image_metrics) - len(recall_rows)),
     }
 
 

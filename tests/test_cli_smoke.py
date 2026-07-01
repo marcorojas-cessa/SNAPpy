@@ -179,7 +179,7 @@ def test_cli_optimize_dry_run_reports_safe_plan(tmp_path) -> None:
     )
     payload = json.loads(proc.stdout)
 
-    assert payload["unique_stage1_preflight_configs"] == 144
+    assert payload["unique_stage1_preflight_configs"] == 168
     assert payload["max_stage2_recipe_entries_after_shortlist"] == 20
     assert payload["optimization_mode"] == "fixed_split"
     assert (out_dir / "optimizer_plan.dry_run.json").exists()
