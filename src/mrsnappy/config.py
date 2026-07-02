@@ -30,16 +30,16 @@ DEFAULT_NATIVE_CONFIG: dict[str, Any] = {
     "stage1_detector_set": "hmax",
     "stage1_log_sigmas": [1.0, 2.0, 3.0],
     "stage1_log_sigmas_nm": [],
-    "stage1_log_thresholds": [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0],
+    "stage1_log_thresholds": [0.5, 1.0, 1.5, 2.0, 3.0],
     "stage1_maxima_neighborhoods": [1, 2],
     "stage1_maxima_min_distances_nm": [],
-    "stage1_hmax_multipliers": [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0],
+    "stage1_hmax_multipliers": [0.5, 1.0, 1.5, 2.0, 3.0],
     "stage1_hmax_sigma_mode": "robust",
     "stage1_smoothing_sigmas": ["off", 0.5, 1.0, 2.0],
     "stage1_smoothing_sigmas_nm": [],
     "stage1_background_method": "rolling_box_3d",
-    "stage1_background_params": ["off", 5.0, 10.0],
-    "stage1_background_params_nm": [],
+    "stage1_background_radii": ["off", 5.0, 10.0],
+    "stage1_background_radii_nm": [],
     "runtime_cache": {
         "stage1_cache_enabled": True,
         "stage1_cache_entries": 128,
@@ -120,20 +120,38 @@ DEFAULT_NATIVE_CONFIG: dict[str, Any] = {
 }
 
 
+def _local_maxima_stage1_options(
+    neighborhoods: list[int],
+    min_distances_nm: list[float],
+) -> list[dict[str, Any]]:
+    neighborhood_values = [int(value) for value in neighborhoods]
+    min_distance_values = [float(value) for value in min_distances_nm]
+    return [
+        *[{"maxima_neighborhood": neighborhood} for neighborhood in neighborhood_values],
+        *[
+            {
+                "maxima_neighborhood": None,
+                "maxima_min_distance_nm": min_distance,
+            }
+            for min_distance in min_distance_values
+        ],
+    ]
+
+
 def _log_stage1_grid(
     sigmas: list[float],
     thresholds: list[float],
-    neighborhoods: list[int],
+    maxima_options: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     return [
         {
             "maxima_method": "log",
             "sigma_value": float(sigma),
-            "maxima_neighborhood": int(neighborhood),
             "threshold_value": float(threshold),
+            **deepcopy(maxima_option),
         }
         for sigma in sigmas
-        for neighborhood in neighborhoods
+        for maxima_option in maxima_options
         for threshold in thresholds
     ]
 
@@ -141,60 +159,38 @@ def _log_stage1_grid(
 def _log_stage1_grid_nm(
     sigmas_nm: list[float],
     thresholds: list[float],
-    min_distances_nm: list[float],
+    maxima_options: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     return [
         {
             "maxima_method": "log",
             "sigma_value": None,
             "sigma_nm": float(sigma),
-            "maxima_neighborhood": None,
-            "maxima_min_distance_nm": float(min_distance),
             "threshold_value": float(threshold),
+            **deepcopy(maxima_option),
         }
         for sigma in sigmas_nm
-        for min_distance in min_distances_nm
+        for maxima_option in maxima_options
         for threshold in thresholds
     ]
 
 
 def _hmax_stage1_grid(
     multipliers: list[float],
-    neighborhoods: list[int],
+    maxima_options: list[dict[str, Any]],
     sigma_mode: str = "robust",
 ) -> list[dict[str, Any]]:
     return [
         {
             "maxima_method": "h_max",
-            "maxima_neighborhood": int(neighborhood),
             "sigma_value": None,
             "sigma_nm": None,
             "threshold_value": None,
             "h_max_sigma_multiplier": float(multiplier),
             "h_max_sigma_mode": str(sigma_mode),
+            **deepcopy(maxima_option),
         }
-        for neighborhood in neighborhoods
-        for multiplier in multipliers
-    ]
-
-
-def _hmax_stage1_grid_nm(
-    multipliers: list[float],
-    min_distances_nm: list[float],
-    sigma_mode: str = "robust",
-) -> list[dict[str, Any]]:
-    return [
-        {
-            "maxima_method": "h_max",
-            "maxima_neighborhood": None,
-            "maxima_min_distance_nm": float(min_distance),
-            "sigma_value": None,
-            "sigma_nm": None,
-            "threshold_value": None,
-            "h_max_sigma_multiplier": float(multiplier),
-            "h_max_sigma_mode": str(sigma_mode),
-        }
-        for min_distance in min_distances_nm
+        for maxima_option in maxima_options
         for multiplier in multipliers
     ]
 
@@ -202,12 +198,12 @@ def _hmax_stage1_grid_nm(
 STAGE1_DETECTOR_PRESETS: dict[str, list[dict[str, Any]]] = {
     "log": _log_stage1_grid(
         sigmas=[1.0, 2.0, 3.0],
-        thresholds=[0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0],
-        neighborhoods=[1, 2],
+        thresholds=[0.5, 1.0, 1.5, 2.0, 3.0],
+        maxima_options=_local_maxima_stage1_options([1, 2], []),
     ),
     "hmax": _hmax_stage1_grid(
-        multipliers=[0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0],
-        neighborhoods=[1, 2],
+        multipliers=[0.5, 1.0, 1.5, 2.0, 3.0],
+        maxima_options=_local_maxima_stage1_options([1, 2], []),
         sigma_mode="robust",
     ),
 }
@@ -261,8 +257,8 @@ _STAGE1_SWEEP_LIST_KEYS = (
     "stage1_hmax_multipliers",
     "stage1_smoothing_sigmas",
     "stage1_smoothing_sigmas_nm",
-    "stage1_background_params",
-    "stage1_background_params_nm",
+    "stage1_background_radii",
+    "stage1_background_radii_nm",
 )
 _STAGE1_MATRIX_KEYS = set(_STAGE1_SWEEP_LIST_KEYS) | {"stage1_detector_set", "stage1_recipes"}
 _STAGE2_SWEEP_LIST_KEYS = ("stage2_feature_packs",)
@@ -292,25 +288,25 @@ def _stage1_detector_rows(cfg: dict[str, Any], detector_set: str) -> list[dict[s
     min_distances_nm = [float(value) for value in cfg.get("stage1_maxima_min_distances_nm", [])]
     multipliers = [float(value) for value in cfg.get("stage1_hmax_multipliers", [])]
     sigma_mode = str(cfg.get("stage1_hmax_sigma_mode", "robust"))
+    maxima_options = _local_maxima_stage1_options(neighborhoods, min_distances_nm)
     rows: list[dict[str, Any]] = []
     if detector_set == "log":
         rows.extend(
             _log_stage1_grid(
                 [float(value) for value in cfg.get("stage1_log_sigmas", [])],
                 thresholds,
-                neighborhoods,
+                maxima_options,
             )
         )
         rows.extend(
             _log_stage1_grid_nm(
                 [float(value) for value in cfg.get("stage1_log_sigmas_nm", [])],
                 thresholds,
-                min_distances_nm,
+                maxima_options,
             )
         )
     elif detector_set == "hmax":
-        rows.extend(_hmax_stage1_grid(multipliers, neighborhoods, sigma_mode=sigma_mode))
-        rows.extend(_hmax_stage1_grid_nm(multipliers, min_distances_nm, sigma_mode=sigma_mode))
+        rows.extend(_hmax_stage1_grid(multipliers, maxima_options, sigma_mode=sigma_mode))
     if not rows:
         raise ValueError(f"stage1_detector_set={detector_set!r} produced no Stage 1 recipes.")
     return rows
@@ -783,12 +779,12 @@ def _expand_stage1_processing_rows(base_row: dict[str, Any], cfg: dict[str, Any]
     has_explicit_background = any(
         key in base_row for key in ("background_enabled", "background_method", "background_param", "background_param_nm")
     )
-    background_params = cfg.get("stage1_background_params", []) or []
-    background_params_nm = cfg.get("stage1_background_params_nm", []) or []
-    if (background_params or background_params_nm) and not has_explicit_background:
+    background_radii = cfg.get("stage1_background_radii", []) or []
+    background_radii_nm = cfg.get("stage1_background_radii_nm", []) or []
+    if (background_radii or background_radii_nm) and not has_explicit_background:
         expanded: list[dict[str, Any]] = []
         for row in rows:
-            for radius in background_params:
+            for radius in background_radii:
                 if _matrix_value_is_off(radius):
                     expanded.append(
                         {
@@ -809,7 +805,7 @@ def _expand_stage1_processing_rows(base_row: dict[str, Any], cfg: dict[str, Any]
                         "background_param_nm": None,
                     }
                 )
-            for radius_nm in background_params_nm:
+            for radius_nm in background_radii_nm:
                 if _matrix_value_is_off(radius_nm):
                     expanded.append(
                         {
@@ -867,6 +863,8 @@ def _stage1_recipe_id(recipe: dict[str, Any]) -> str:
         h_mode = _id_value(str(recipe.get("h_max_sigma_mode", "robust")).lower())
         if _has_value(recipe, "maxima_min_distance_nm"):
             min_distance_text = f"{_id_value(recipe['maxima_min_distance_nm'])}nm"
+            if _has_value(recipe, "maxima_neighborhood"):
+                min_distance_text = f"{_id_value(recipe['maxima_neighborhood'])}vox_{min_distance_text}"
         else:
             min_distance_text = _id_value(recipe["maxima_neighborhood"])
         return f"hmax_{h_mode}_h{h_text}_n{min_distance_text}_{smooth_text}_{bg_text}"
@@ -876,6 +874,8 @@ def _stage1_recipe_id(recipe: dict[str, Any]) -> str:
         sigma_text = _id_value(recipe["sigma_value"])
     if _has_value(recipe, "maxima_min_distance_nm"):
         min_distance_text = f"{_id_value(recipe['maxima_min_distance_nm'])}nm"
+        if _has_value(recipe, "maxima_neighborhood"):
+            min_distance_text = f"{_id_value(recipe['maxima_neighborhood'])}vox_{min_distance_text}"
     else:
         min_distance_text = _id_value(recipe["maxima_neighborhood"])
     thresh_text = _id_value(recipe["threshold_value"])
@@ -917,9 +917,11 @@ def _stage1_dedup_key(recipe: dict[str, Any]) -> str:
         "background_enabled": bool(recipe.get("background_enabled", False)),
         "maxima_method": method,
     }
+    if _has_value(recipe, "maxima_neighborhood"):
+        payload["maxima_neighborhood"] = int(recipe.get("maxima_neighborhood", 2))
     if _has_value(recipe, "maxima_min_distance_nm"):
         payload["maxima_min_distance_nm"] = recipe.get("maxima_min_distance_nm")
-    else:
+    elif not _has_value(recipe, "maxima_neighborhood"):
         payload["maxima_neighborhood"] = int(recipe.get("maxima_neighborhood", 2))
     if payload["preproc_enabled"]:
         payload["preproc_method"] = recipe.get("preproc_method")

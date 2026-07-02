@@ -113,7 +113,10 @@ def detect_candidates(volume: np.ndarray, cfg: dict) -> DetectionResult:
     method = str(cfg.get("maxima_method", "log")).lower()
     max_candidates = cfg.get("max_candidates")
     physical_nms = _has_value(cfg, "maxima_min_distance_nm")
-    peak_min_distance = 1 if physical_nms else max(int(cfg.get("maxima_neighborhood", 2)), 1)
+    if _has_value(cfg, "maxima_neighborhood"):
+        peak_min_distance = max(int(cfg["maxima_neighborhood"]), 1)
+    else:
+        peak_min_distance = 1 if physical_nms else max(int(cfg.get("maxima_neighborhood", 2)), 1)
     peak_kwargs = _peak_local_max_kwargs(max_candidates) if physical_nms else {}
     if max_candidates is not None and not physical_nms:
         peak_kwargs["num_peaks"] = max(int(max_candidates), 1)

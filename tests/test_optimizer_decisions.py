@@ -616,8 +616,8 @@ def test_optimizer_plan_counts_stage1_before_stage2_expansion(tmp_path) -> None:
 
     plan = optimizer_plan(config_path)
 
-    assert plan["stage1_recipe_bank_entries"] == 168
-    assert plan["unique_stage1_preflight_configs"] == 168
+    assert plan["stage1_recipe_bank_entries"] == 120
+    assert plan["unique_stage1_preflight_configs"] == 120
     assert plan["shortlist_top_k"] == 5
     assert plan["max_stage2_recipe_entries_after_shortlist"] == 20
     assert plan["svm_param_grid_entries_per_stage2_recipe"] == 48
@@ -626,7 +626,7 @@ def test_optimizer_plan_counts_stage1_before_stage2_expansion(tmp_path) -> None:
 def test_optimizer_plan_safety_stops_accidental_large_runs() -> None:
     cfg = {"optimizer": {"max_stage1_preflight_configs": 10, "max_stage2_recipes_after_shortlist": 20}}
     plan = {
-        "unique_stage1_preflight_configs": 168,
+        "unique_stage1_preflight_configs": 120,
         "max_stage2_recipe_entries_after_shortlist": 21,
     }
 

@@ -198,6 +198,35 @@ def test_physical_suppression_rejects_candidates_at_exact_min_distance() -> None
     assert result.coords.tolist() == [[3.0, 3.0, 1.0]]
 
 
+def test_physical_nms_still_uses_configured_voxel_peak_neighborhood(monkeypatch) -> None:
+    volume = np.zeros((7, 7, 7), dtype=np.float32)
+    volume[3, 3, 3] = 5.0
+    volume[3, 3, 4] = 4.0
+    observed_min_distances: list[int] = []
+
+    def fake_peak_local_max(response, *args, **kwargs):
+        observed_min_distances.append(kwargs["min_distance"])
+        return np.asarray([[3, 3, 3], [3, 3, 4]], dtype=np.int32)
+
+    monkeypatch.setattr("mrsnappy.detection.peak_local_max", fake_peak_local_max)
+
+    result = detect_candidates(
+        volume,
+        {
+            "maxima_method": "h_max",
+            "h_max_sigma_multiplier": 0.01,
+            "h_max_sigma_mode": "std",
+            "maxima_neighborhood": 2,
+            "maxima_min_distance_nm": 1.0,
+            "xy_spacing_nm": 100.0,
+            "z_spacing_nm": 300.0,
+        },
+    )
+
+    assert observed_min_distances == [2]
+    assert result.coords.tolist() == [[3.0, 3.0, 3.0], [3.0, 3.0, 4.0]]
+
+
 def test_regional_detector_is_not_supported() -> None:
     with pytest.raises(ValueError, match="Expected 'log' or 'h_max'"):
         detect_candidates(

@@ -63,7 +63,7 @@ def test_physical_stage1_processing_lists_accept_off_without_voxel_lists(tmp_pat
                 "stage1_maxima_min_distances_nm": [128.866],
                 "stage1_hmax_multipliers": [1.0],
                 "stage1_smoothing_sigmas_nm": ["off", 128.866],
-                "stage1_background_params_nm": ["off", 644.33],
+                "stage1_background_radii_nm": ["off", 644.33],
             }
         )
     )
@@ -77,6 +77,64 @@ def test_physical_stage1_processing_lists_accept_off_without_voxel_lists(tmp_pat
     assert any(float(recipe.get("background_param_nm") or 0.0) == pytest.approx(644.33) for recipe in recipes)
 
 
+def test_physical_stage1_detector_sweeps_voxel_and_physical_neighborhood_alternatives(tmp_path) -> None:
+    config_path = tmp_path / "physical_neighborhood_processing.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "stage1_detector_set": "hmax",
+                "stage1_maxima_neighborhoods": [1, 2],
+                "stage1_maxima_min_distances_nm": [386.598],
+                "stage1_hmax_multipliers": [1.0],
+                "stage1_smoothing_sigmas_nm": ["off"],
+                "stage1_background_radii_nm": ["off"],
+            }
+        )
+    )
+    cfg = load_config(config_path)
+    recipes = recipe_bank(cfg)
+
+    assert len(recipes) == 3
+    voxel_recipes = [recipe for recipe in recipes if recipe.get("maxima_min_distance_nm") is None]
+    physical_recipes = [recipe for recipe in recipes if recipe.get("maxima_min_distance_nm") is not None]
+    assert sorted({recipe["maxima_neighborhood"] for recipe in voxel_recipes}) == [1, 2]
+    assert len(physical_recipes) == 1
+    assert physical_recipes[0]["maxima_neighborhood"] is None
+    assert physical_recipes[0]["maxima_min_distance_nm"] == 386.598
+    assert len({recipe["recipe_id"] for recipe in recipes}) == 3
+    assert len({recipe["stage1_dedup_key"] for recipe in recipes}) == 3
+
+
+def test_stage1_processing_sweeps_voxel_and_physical_unit_alternatives(tmp_path) -> None:
+    config_path = tmp_path / "mixed_unit_processing.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "stage1_detector_set": "hmax",
+                "stage1_maxima_neighborhoods": [1],
+                "stage1_maxima_min_distances_nm": [386.598],
+                "stage1_hmax_multipliers": [1.0],
+                "stage1_smoothing_sigmas": ["off", 1.0],
+                "stage1_smoothing_sigmas_nm": [128.866],
+                "stage1_background_radii": ["off", 5.0],
+                "stage1_background_radii_nm": [644.33],
+            }
+        )
+    )
+    cfg = load_config(config_path)
+    recipes = recipe_bank(cfg)
+
+    assert len(recipes) == 18
+    assert any(recipe["maxima_neighborhood"] == 1 and recipe.get("maxima_min_distance_nm") is None for recipe in recipes)
+    assert any(recipe["maxima_neighborhood"] is None and recipe.get("maxima_min_distance_nm") == 386.598 for recipe in recipes)
+    assert any(not recipe["preproc_enabled"] for recipe in recipes)
+    assert any(recipe.get("preproc_sigma") == 1.0 for recipe in recipes)
+    assert any(recipe.get("preproc_sigma_nm") == 128.866 for recipe in recipes)
+    assert any(not recipe["background_enabled"] for recipe in recipes)
+    assert any(recipe.get("background_param") == 5.0 for recipe in recipes)
+    assert any(recipe.get("background_param_nm") == 644.33 for recipe in recipes)
+
+
 def test_default_hmax_sweeps_match_published_grid() -> None:
     recipes = _default_recipe_bank()
     hmax_multiplier = sorted({float(recipe["h_max_sigma_multiplier"]) for recipe in recipes})
@@ -84,7 +142,7 @@ def test_default_hmax_sweeps_match_published_grid() -> None:
     hmax_mode = {str(recipe["h_max_sigma_mode"]) for recipe in recipes}
 
     assert {recipe["maxima_method"] for recipe in recipes} == {"h_max"}
-    assert hmax_multiplier == [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0]
+    assert hmax_multiplier == [0.5, 1.0, 1.5, 2.0, 3.0]
     assert hmax_neighborhood == [1, 2]
     assert hmax_mode == {"robust"}
 
@@ -96,10 +154,10 @@ def test_log_detector_set_sweeps_match_published_grid(tmp_path) -> None:
             {
                 "stage1_detector_set": "log",
                 "stage1_log_sigmas": [1.0, 2.0, 3.0],
-                "stage1_log_thresholds": [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0],
+                "stage1_log_thresholds": [0.5, 1.0, 1.5, 2.0, 3.0],
                 "stage1_maxima_neighborhoods": [1, 2],
                 "stage1_smoothing_sigmas": [0.5],
-                "stage1_background_params": [],
+                "stage1_background_radii": [],
             }
         )
     )
@@ -107,7 +165,7 @@ def test_log_detector_set_sweeps_match_published_grid(tmp_path) -> None:
     recipes = recipe_bank(cfg)
 
     assert sorted({float(recipe["sigma_value"]) for recipe in recipes}) == [1.0, 2.0, 3.0]
-    assert sorted({float(recipe["threshold_value"]) for recipe in recipes}) == [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0]
+    assert sorted({float(recipe["threshold_value"]) for recipe in recipes}) == [0.5, 1.0, 1.5, 2.0, 3.0]
     assert sorted({int(recipe["maxima_neighborhood"]) for recipe in recipes}) == [1, 2]
 
 
@@ -115,7 +173,7 @@ def test_default_sweep_has_unique_recipe_ids_and_expected_size() -> None:
     recipes = _default_recipe_bank()
     recipe_ids = [recipe["recipe_id"] for recipe in recipes]
 
-    assert len(recipes) == 168
+    assert len(recipes) == 120
     assert len(recipe_ids) == len(set(recipe_ids))
     assert len({recipe["stage1_dedup_key"] for recipe in recipes}) == len(recipes)
 
@@ -125,8 +183,8 @@ def test_stage1_recipe_bank_deduplicates_equivalent_candidate_generation_configs
     config_path.write_text(
         json.dumps(
                 {
-                    "stage1_background_params": [],
-                    "stage1_background_params_nm": [],
+                    "stage1_background_radii": [],
+                    "stage1_background_radii_nm": [],
                     "stage1_smoothing_sigmas": [],
                     "stage1_smoothing_sigmas_nm": [],
                     "stage1_recipes": [
@@ -159,8 +217,8 @@ def test_stage1_recipe_bank_deduplicates_equivalent_candidate_generation_configs
 
 def test_stage1_detector_presets_are_log_or_hmax_only() -> None:
     assert sorted(STAGE1_DETECTOR_PRESETS) == ["hmax", "log"]
-    assert len(STAGE1_DETECTOR_PRESETS["log"]) == 42
-    assert len(STAGE1_DETECTOR_PRESETS["hmax"]) == 14
+    assert len(STAGE1_DETECTOR_PRESETS["log"]) == 30
+    assert len(STAGE1_DETECTOR_PRESETS["hmax"]) == 10
 
 
 def test_hmax_detector_set_uses_explicit_matrix_values(tmp_path) -> None:
@@ -170,18 +228,18 @@ def test_hmax_detector_set_uses_explicit_matrix_values(tmp_path) -> None:
             {
                 "stage1_detector_set": "hmax",
                 "stage1_maxima_neighborhoods": [1, 2],
-                "stage1_hmax_multipliers": [0.1, 0.25, 0.5, 1.0, 1.5, 2.0],
+                "stage1_hmax_multipliers": [0.5, 1.0, 1.5, 2.0, 3.0],
                 "stage1_smoothing_sigmas": [0.5, 1.0, 2.0],
-                "stage1_background_params": ["off", 5.0, 10.0],
+                "stage1_background_radii": ["off", 5.0, 10.0],
             }
         )
     )
     cfg = load_config(config_path)
     recipes = recipe_bank(cfg)
 
-    assert len(recipes) == 108
+    assert len(recipes) == 90
     assert {recipe["maxima_method"] for recipe in recipes} == {"h_max"}
-    assert sorted({recipe["h_max_sigma_multiplier"] for recipe in recipes}) == [0.1, 0.25, 0.5, 1.0, 1.5, 2.0]
+    assert sorted({recipe["h_max_sigma_multiplier"] for recipe in recipes}) == [0.5, 1.0, 1.5, 2.0, 3.0]
     assert sorted({recipe["maxima_neighborhood"] for recipe in recipes}) == [1, 2]
     assert sorted({recipe["preproc_sigma"] for recipe in recipes}) == [0.5, 1.0, 2.0]
     assert sorted({recipe["background_param"] for recipe in recipes if recipe["background_enabled"]}) == [5.0, 10.0]
@@ -206,9 +264,9 @@ def test_physical_stage1_fields_do_not_inherit_unspecified_voxel_sweeps(tmp_path
                 "stage1_detector_set": "log",
                 "stage1_log_sigmas_nm": [130.0],
                 "stage1_maxima_min_distances_nm": [130.0],
-                "stage1_log_thresholds": [0.1],
+                "stage1_log_thresholds": [0.5],
                 "stage1_smoothing_sigmas_nm": [130.0],
-                "stage1_background_params_nm": [],
+                "stage1_background_radii_nm": [],
             }
         )
     )
@@ -219,7 +277,7 @@ def test_physical_stage1_fields_do_not_inherit_unspecified_voxel_sweeps(tmp_path
     assert cfg["stage1_log_sigmas"] == []
     assert cfg["stage1_maxima_neighborhoods"] == []
     assert cfg["stage1_smoothing_sigmas"] == []
-    assert cfg["stage1_background_params"] == []
+    assert cfg["stage1_background_radii"] == []
     assert recipes[0]["sigma_value"] is None
     assert recipes[0]["maxima_neighborhood"] is None
     assert recipes[0]["sigma_nm"] == 130.0
@@ -233,8 +291,8 @@ def test_hmax_recipe_ids_include_sigma_mode_to_avoid_ambiguous_runs(tmp_path) ->
     config_path.write_text(
         json.dumps(
                 {
-                    "stage1_background_params": [],
-                    "stage1_background_params_nm": [],
+                    "stage1_background_radii": [],
+                    "stage1_background_radii_nm": [],
                     "stage1_smoothing_sigmas": [],
                     "stage1_smoothing_sigmas_nm": [],
                     "stage1_recipes": [
@@ -267,8 +325,8 @@ def test_custom_hmax_alias_normalizes_to_h_max(tmp_path) -> None:
     config_path.write_text(
         json.dumps(
                 {
-                    "stage1_background_params": [],
-                    "stage1_background_params_nm": [],
+                    "stage1_background_radii": [],
+                    "stage1_background_radii_nm": [],
                     "stage1_smoothing_sigmas": [],
                     "stage1_smoothing_sigmas_nm": [],
                     "stage1_recipes": [

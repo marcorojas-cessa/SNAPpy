@@ -32,11 +32,12 @@ stage1_detector_set: hmax
 # Physical-unit LoG and local-maximum sweep. These are mainly used if
 # stage1_detector_set is changed to log.
 stage1_log_sigmas_nm: [128.866, 257.732, 386.598]
-stage1_log_thresholds: [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0]
-stage1_maxima_min_distances_nm: [128.866, 257.732]
+stage1_log_thresholds: [0.5, 1.0, 1.5, 2.0, 3.0]
+stage1_maxima_neighborhoods: [1, 2]
+stage1_maxima_min_distances_nm: [300.0]
 
 # Used when stage1_detector_set is hmax.
-stage1_hmax_multipliers: [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0]
+stage1_hmax_multipliers: [0.5, 1.0, 1.5, 2.0, 3.0]
 
 # 3D Gaussian smoothing sigmas in nanometers. The literal value off includes
 # an unsmoothed Stage 1 recipe.
@@ -47,7 +48,7 @@ stage1_background_method: rolling_box_3d
 
 # Background radii in nanometers. The literal value off includes recipes
 # without background correction.
-stage1_background_params_nm: ["off", 644.330, 1288.660]
+stage1_background_radii_nm: ["off", 644.330, 1288.660]
 
 # Stage 1 pass/fail guardrails and ranking into Stage 2.
 preflight:

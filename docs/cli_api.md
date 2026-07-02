@@ -225,14 +225,14 @@ Exactly one of `match_distance` or `match_distance_nm` must be set.
 | `stage1_log_sigmas_nm` | list of positive numbers | LoG Gaussian sigmas in nanometers. |
 | `stage1_log_thresholds` | list of numbers | Thresholds applied to robust-z-normalized LoG response. |
 | `stage1_maxima_neighborhoods` | list of positive integers | Voxel-unit local-maxima spacing for LoG or h-max recipes. |
-| `stage1_maxima_min_distances_nm` | list of positive numbers | Physical non-maximum-suppression distances in nanometers. |
+| `stage1_maxima_min_distances_nm` | list of positive numbers | Physical non-maximum-suppression distances in nanometers. These are swept as alternatives to voxel-unit `stage1_maxima_neighborhoods`, not paired with them. |
 | `stage1_hmax_multipliers` | list of positive numbers | h-max prominence threshold as multiplier times image noise estimate. |
 | `stage1_hmax_sigma_mode` | `robust` or `std` | Noise estimate used for h-max thresholding. |
 | `stage1_smoothing_sigmas` | list of positive numbers plus optional `off` | 3D Gaussian smoothing sigmas in voxel units. |
-| `stage1_smoothing_sigmas_nm` | list of positive numbers plus optional `off` | 3D Gaussian smoothing sigmas in nanometers. |
+| `stage1_smoothing_sigmas_nm` | list of positive numbers plus optional `off` | 3D Gaussian smoothing sigmas in nanometers. These are swept as alternatives to voxel-unit smoothing sigmas. |
 | `stage1_background_method` | `rolling_box_3d`, `slice_opening_2d`, `rolling_ball_2d`, or `rolling_ball_3d` | Background method swept when background radii are provided. |
-| `stage1_background_params` | list of positive numbers plus optional `off` | Background radii in voxel units. |
-| `stage1_background_params_nm` | list of positive numbers plus optional `off` | Background radii in nanometers. |
+| `stage1_background_radii` | list of positive numbers plus optional `off` | Background radii in voxel units. |
+| `stage1_background_radii_nm` | list of positive numbers plus optional `off` | Background radii in nanometers. These are swept as alternatives to voxel-unit background radii. |
 
 Physical-unit fields use `pipeline_defaults.xy_spacing_nm` and
 `pipeline_defaults.z_spacing_nm` to convert nanometers to axis-specific voxel

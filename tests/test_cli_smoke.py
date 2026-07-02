@@ -179,7 +179,7 @@ def test_cli_optimize_dry_run_reports_safe_plan(tmp_path) -> None:
     )
     payload = json.loads(proc.stdout)
 
-    assert payload["unique_stage1_preflight_configs"] == 168
+    assert payload["unique_stage1_preflight_configs"] == 120
     assert payload["max_stage2_recipe_entries_after_shortlist"] == 20
     assert payload["optimization_mode"] == "fixed_split"
     assert (out_dir / "optimizer_plan.dry_run.json").exists()
@@ -213,8 +213,8 @@ def test_api_optimize_writes_default_model_package(tmp_path) -> None:
                 },
                 "stage1_smoothing_sigmas": [],
                 "stage1_smoothing_sigmas_nm": [100.0],
-                "stage1_background_params": [],
-                "stage1_background_params_nm": [],
+                "stage1_background_radii": [],
+                "stage1_background_radii_nm": [],
                 "stage1_recipes": [
                     {
                         "maxima_method": "log",
