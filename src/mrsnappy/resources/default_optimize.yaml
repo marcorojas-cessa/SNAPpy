@@ -93,6 +93,19 @@ optimizer:
   max_stage1_preflight_configs: 1000
   max_stage2_recipes_after_shortlist: 100
 
+profiling:
+  enabled: true
+  train_image_count: 8
+  val_image_count: 4
+  gt_intensity_radius: 1
+  # null uses dimensionality-aware defaults:
+  # 2D sparse/dense thresholds are 16/64 labels per image.
+  # 3D sparse/dense thresholds are 64/256 labels per image.
+  sparse_label_mean_max: null
+  dense_label_mean_min: null
+  stage1_augmentation_enabled: false
+  apply_runtime_pruning_to_explicit_recipes: false
+
 pipeline_defaults:
   # Image dimensionality. Keep 3 for z-stacks. Set to 2 for native 2D images;
   # in 2D mode z_spacing_nm is not used and z-derived features are omitted.

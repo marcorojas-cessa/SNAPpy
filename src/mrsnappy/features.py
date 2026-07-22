@@ -159,7 +159,6 @@ _2D_FEATURE_RENAMES = {
     "sigma_product_nm3": "sigma_product_nm2",
     "component_voxel_volume": "component_pixel_area",
     "component_surface_area_vox2": "component_boundary_px",
-    "component_surface_area_vox_2": "component_boundary_px",
     "component_surface_to_volume_ratio": "component_boundary_to_area_ratio",
     "component_sphericity_3d": "component_circularity_2d",
     "component_convex_voxel_volume": "component_convex_size_px",
@@ -304,13 +303,19 @@ def _distortion_shape_features_2d_vectorized(df: pd.DataFrame, xy_spacing_nm: fl
 
 def _infer_fit_method_id(df: pd.DataFrame) -> str | None:
     if "fit_method_id" in df.columns and len(df):
-        values = [str(value) for value in df["fit_method_id"].dropna().unique()]
+        values = [normalize_fit_method_id(value) for value in df["fit_method_id"].dropna().unique()]
         if len(values) == 1:
-            return normalize_fit_method_id(values[0])
+            return values[0]
+        non_moments = {value for value in values if value != "moments"}
+        if len(non_moments) == 1:
+            return next(iter(non_moments))
     if "fit_method" in df.columns and len(df):
-        values = [str(value) for value in df["fit_method"].dropna().unique()]
+        values = [normalize_fit_method_id(value) for value in df["fit_method"].dropna().unique()]
         if len(values) == 1:
-            return normalize_fit_method_id(values[0])
+            return values[0]
+        non_moments = {value for value in values if value != "moments"}
+        if len(non_moments) == 1:
+            return next(iter(non_moments))
     return None
 
 
@@ -321,6 +326,7 @@ def feature_table(
     xy_spacing_nm: float | None = None,
     z_spacing_nm: float | None = None,
     image_dimensionality: int | None = None,
+    fit_method: Any | None = None,
 ) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=selected_features or [])
@@ -379,7 +385,9 @@ def feature_table(
     df["quality_weighted_snr"] = df["r_squared"] * np.log10(np.maximum(df["fit_snr"], 0.0) + 1.0)
     df["quality_vs_size_penalty"] = df["r_squared"] / np.maximum(df["sigma_total_nm"], EPS)
 
-    fit_method_id = _infer_fit_method_id(df)
+    fit_method_id = normalize_fit_method_id(fit_method) if fit_method is not None else None
+    if not fit_method_id:
+        fit_method_id = _infer_fit_method_id(df)
     needs_distortion = selected_feature_set is None or bool(selected_feature_set & set(DISTORTION_FEATURES))
     needs_distortion_shape = selected_feature_set is None or bool(selected_feature_set & {"covariance_elongation", "long_axis_z_alignment"})
     if image_ndim == 2 and fit_method_id == "distorted_gaussian_2d" and needs_distortion and "rho_xy" in df.columns:
@@ -429,7 +437,6 @@ def feature_table(
             return pd.DataFrame(index=df.index)
         missing = [col for col in selected_features if col not in df.columns]
         if missing:
-            fit_method_id = _infer_fit_method_id(df)
             suffix = f" for fit_method={fit_method_id}" if fit_method_id else ""
             raise ValueError(
                 "Selected SNAPpy feature(s) are unavailable"

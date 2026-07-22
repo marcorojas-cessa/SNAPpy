@@ -130,6 +130,15 @@ def _empty_coords(ndim: int) -> np.ndarray:
     return np.empty((0, int(ndim)), dtype=np.float32)
 
 
+def _infer_prediction_dimensionality(preds: dict[str, np.ndarray], gts: dict[str, np.ndarray], fallback: int = 3) -> int:
+    for collection in (preds, gts):
+        for values in collection.values():
+            arr = np.asarray(values)
+            if arr.ndim == 2:
+                return int(arr.shape[1])
+    return int(fallback)
+
+
 def _match_spacing_array(match_spacing_nm: tuple[float, ...] | None, ndim: int) -> np.ndarray | None:
     if match_spacing_nm is None:
         return None
@@ -726,6 +735,7 @@ def detect_image(image_path: str | Path, pipeline_cfg: dict[str, Any], label_cou
         xy_spacing_nm=pipeline_cfg.get("xy_spacing_nm"),
         z_spacing_nm=pipeline_cfg.get("z_spacing_nm"),
         image_dimensionality=feature_volume.ndim,
+        fit_method=pipeline_cfg.get("fit_method"),
     )
     payload = (np.asarray(fit.coords, dtype=np.float32), np.asarray(scores, dtype=np.float32), all_features)
     if bool(pipeline_cfg.get("fit_cache_enabled", True)):
@@ -1185,9 +1195,10 @@ def evaluate_predictions(
     match_spacing_nm: tuple[float, ...] | None = None,
 ) -> dict[str, float]:
     totals = {"tp": 0, "fp": 0, "fn": 0}
+    fallback_ndim = _infer_prediction_dimensionality(preds, gts)
     for key in sorted(gts):
         gt = gts[key]
-        gt_ndim = gt.shape[1] if np.asarray(gt).ndim == 2 else 3
+        gt_ndim = gt.shape[1] if np.asarray(gt).ndim == 2 else fallback_ndim
         pred = preds.get(key, _empty_coords(gt_ndim))
         tp, fp, fn = match_points(pred, gt, match_distance, match_spacing_nm=match_spacing_nm)
         totals["tp"] += tp
@@ -1218,9 +1229,10 @@ def evaluate_predictions_for_selection(
     """
     totals = {"tp": 0, "fp": 0, "fn": 0}
     per_image_metrics: list[dict[str, float | bool]] = []
+    fallback_ndim = _infer_prediction_dimensionality(preds, gts)
     for key in sorted(gts):
         gt = gts[key]
-        gt_ndim = gt.shape[1] if np.asarray(gt).ndim == 2 else 3
+        gt_ndim = gt.shape[1] if np.asarray(gt).ndim == 2 else fallback_ndim
         pred = preds.get(key, _empty_coords(gt_ndim))
         tp, fp, fn = match_points(pred, gt, match_distance, match_spacing_nm=match_spacing_nm)
         totals["tp"] += tp

@@ -1,15 +1,19 @@
+import numpy as np
 import pandas as pd
 import pytest
 
+import mrsnappy.optimizer as optimizer
 from mrsnappy.config import DEFAULT_NATIVE_CONFIG, deep_merge, load_config, recipe_bank
 from mrsnappy.optimizer import (
     _FINALIST_SORT_ASCENDING,
     _FINALIST_SORT_COLUMNS,
     _add_stage2_selection_columns,
     _apply_preflight_decision_columns,
+    _augment_stage1_recipes,
     _expand_stage2_shortlist,
     _enforce_optimizer_plan_safety,
     _mean_per_image_candidate_ratio,
+    _profile_dataset,
     _stage1_failure_reasons,
     _stage1_guardrail_progress,
     _stage2_parameter_payload,
@@ -120,6 +124,21 @@ def test_scalar_svm_settings_do_not_clear_default_svm_sweep(tmp_path) -> None:
     assert cfg["svm_sweep"]["class_weighting"] == "off"
     assert cfg["svm_sweep"]["kernels"] == DEFAULT_NATIVE_CONFIG["svm_sweep"]["kernels"]
     assert cfg["svm_sweep"]["box_constraints"] == DEFAULT_NATIVE_CONFIG["svm_sweep"]["box_constraints"]
+
+
+def test_stage1_matrix_error_names_empty_required_lists(tmp_path) -> None:
+    config_path = tmp_path / "optimize.json"
+    config_path.write_text(
+        """
+        {
+          "stage1_detector_set": "hmax",
+          "stage1_hmax_multipliers": [1.0]
+        }
+        """
+    )
+
+    with pytest.raises(ValueError, match="stage1_maxima_neighborhoods or stage1_maxima_min_distances_nm"):
+        load_config(config_path)
 
 
 def test_stage1_ranking_config_rejects_invalid_values(tmp_path) -> None:
@@ -310,6 +329,90 @@ def test_stage1_guardrail_progress_stops_on_unrecoverable_candidate_ratio() -> N
     ]
 
 
+def test_2d_profile_uses_dimensionality_specific_density_defaults(monkeypatch, tmp_path) -> None:
+    cfg = deep_merge(
+        DEFAULT_NATIVE_CONFIG,
+        {
+            "dataset_root": str(tmp_path),
+            "pipeline_defaults": {
+                "image_dimensionality": 2,
+                "xy_spacing_nm": 100.0,
+                "z_spacing_nm": None,
+            },
+            "profiling": {"enabled": True},
+        },
+    )
+
+    monkeypatch.setattr(
+        optimizer,
+        "split_pairs",
+        lambda root, split: [(tmp_path / f"{split}_image.tif", tmp_path / f"{split}_labels.csv")],
+    )
+    monkeypatch.setattr(optimizer, "read_points_csv", lambda path: np.zeros((32, 2), dtype=np.float32))
+    monkeypatch.setattr(optimizer, "read_volume", lambda path: np.ones((8, 8), dtype=np.float32))
+
+    profile = _profile_dataset(cfg)
+
+    assert profile["image_dimensionality"] == 2
+    assert profile["density_sparse_label_mean_max"] == 16.0
+    assert profile["density_dense_label_mean_min"] == 64.0
+    assert profile["density_regime"] == "moderate"
+
+
+def test_2d_profile_respects_explicit_density_threshold_overrides(monkeypatch, tmp_path) -> None:
+    cfg = deep_merge(
+        DEFAULT_NATIVE_CONFIG,
+        {
+            "dataset_root": str(tmp_path),
+            "pipeline_defaults": {
+                "image_dimensionality": 2,
+                "xy_spacing_nm": 100.0,
+                "z_spacing_nm": None,
+            },
+            "profiling": {
+                "enabled": True,
+                "sparse_label_mean_max": 64.0,
+                "dense_label_mean_min": 256.0,
+            },
+        },
+    )
+
+    monkeypatch.setattr(
+        optimizer,
+        "split_pairs",
+        lambda root, split: [(tmp_path / f"{split}_image.tif", tmp_path / f"{split}_labels.csv")],
+    )
+    monkeypatch.setattr(optimizer, "read_points_csv", lambda path: np.zeros((32, 2), dtype=np.float32))
+    monkeypatch.setattr(optimizer, "read_volume", lambda path: np.ones((8, 8), dtype=np.float32))
+
+    profile = _profile_dataset(cfg)
+
+    assert profile["density_sparse_label_mean_max"] == 64.0
+    assert profile["density_dense_label_mean_min"] == 256.0
+    assert profile["density_regime"] == "sparse"
+
+
+def test_profile_guidance_uses_2d_rolling_box_for_2d_images() -> None:
+    cfg = deep_merge(
+        DEFAULT_NATIVE_CONFIG,
+        {
+            "stage1_recipes": [],
+            "pipeline_defaults": {
+                "image_dimensionality": 2,
+                "xy_spacing_nm": 100.0,
+                "z_spacing_nm": None,
+            },
+        },
+    )
+    profile = {"density_regime": "sparse", "contrast_regime": "moderate", "background_regime": "stable"}
+
+    recipes = _augment_stage1_recipes(cfg, profile)
+    background_methods = {recipe.get("background_method") for recipe in recipes}
+
+    assert "rolling_box_2d" in background_methods
+    assert "rolling_box_3d" not in background_methods
+
+
 def test_preflight_decision_columns_rank_shortlist_and_stage2() -> None:
     df = pd.DataFrame(
         [
@@ -495,6 +598,34 @@ def test_all_positive_stage1_shortlist_expands_to_single_pass_through_recipe() -
     assert recipe["selected_features"] == []
     assert recipe["feature_cache_features"] == []
     assert recipe["fit_method"] == "2D (XY) + 1D (Z) Gaussian"
+
+
+def test_untrainable_stage1_shortlist_expands_to_single_skipped_marker() -> None:
+    cfg = deep_merge(DEFAULT_NATIVE_CONFIG, {"stage2_feature_packs": ["core_fit", "core_contrast"]})
+    stage1_recipe = recipe_bank(cfg)[0]
+    stage1_shortlist = pd.DataFrame(
+        [
+            {
+                "recipe_id": stage1_recipe["recipe_id"],
+                "stage1_key": "stage1_a",
+                "stage1_rank_passed": 1,
+                "passed": True,
+                "stage1_train_label_status": "no_true_positive_training_candidates",
+                "recipe": stage1_recipe,
+            }
+        ]
+    )
+
+    stage2_shortlist = _expand_stage2_shortlist(stage1_shortlist, cfg)
+
+    assert len(stage2_shortlist) == 1
+    recipe = stage2_shortlist.iloc[0]["recipe"]
+    assert stage2_shortlist.iloc[0]["model_type"] == "skipped"
+    assert recipe["model_type"] == "skipped"
+    assert recipe["feature_pack_name"] == "not_applicable"
+    assert recipe["selected_features"] == []
+    assert recipe["stage2_skip_reason"] == "no_true_positive_training_candidates"
+    assert recipe["recipe_id"] == f"{stage1_recipe['recipe_id']}_no_true_positive_training_candidates"
 
 
 def test_stage1_pass_through_export_payload_has_no_svm_or_features() -> None:

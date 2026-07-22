@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.1 - 2D Release Polish and Feature-Pipeline Fixes
+
+This release polishes the native 2D support introduced in 0.4.0 and fixes a
+feature-resolution crash found during 2D pilot testing.
+
+Highlights:
+
+- Fixes mixed distorted-Gaussian plus `moments` fallback feature extraction so
+  distortion/covariance features are omitted when a candidate falls back to
+  moments, instead of crashing.
+- Uses dimensionality-aware dataset-density profiling defaults: native 2D uses
+  lower sparse/dense label-count thresholds than 3D unless the user explicitly
+  overrides them.
+- Uses `rolling_box_2d` for profile-guided 2D Stage 1 recipe augmentation.
+- Carries validation labeled/empty-GT image counts into `model_config.json` and
+  `model_summary.md`.
+- Improves errors for custom Stage 1 matrix configs whose required sweep lists
+  are empty.
+- Short-circuits untrainable shortlisted Stage 1 recipes to one skipped marker
+  row instead of expanding unnecessary feature/SVM combinations.
+- Updates public docs for native 2D image layout, fitting modes, background
+  methods, detection CSV schemas, and feature naming.
+- Loosens the scikit-learn dependency to `>=1.7.2,<2.0` while documenting that
+  model joblib compatibility is bounded by scikit-learn major versions.
+
 ## 0.4.0 - Native 2D Image Support
 
 This release adds first-class native 2D image support while preserving the

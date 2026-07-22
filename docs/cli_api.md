@@ -32,12 +32,24 @@ init_config("config.yaml")
 
 This writes an editable YAML config. It does not read images, optimize a model, or run detection.
 
-Before optimizing, set the physical voxel spacing:
+Before optimizing, set the image dimensionality and physical spacing. For 3D
+z-stacks:
 
 ```yaml
 pipeline_defaults:
+  image_dimensionality: 3
   xy_spacing_nm: 128.866
   z_spacing_nm: 300.0
+```
+
+For native 2D images:
+
+```yaml
+pipeline_defaults:
+  image_dimensionality: 2
+  xy_spacing_nm: 100.0
+  z_spacing_nm: null
+  fit_method: 2D Gaussian
 ```
 
 Use the real pixel spacing and z-step spacing for your microscope data.
@@ -91,7 +103,10 @@ labeled_dataset/
     image_101.csv
 ```
 
-Each 3D TIFF must have a same-stem CSV label file. Label CSV files must contain `x`, `y`, and `z` voxel-coordinate columns.
+Each image must have a same-stem CSV label file. In 3D mode, TIFF images are
+read as `z,y,x`, and labels must contain `x`, `y`, and `z` voxel-coordinate
+columns. In native 2D mode, TIFF images are read as `y,x`, and labels may
+contain `x,y`, `y,x`, or `axis-0,axis-1` style columns.
 
 ### Optimize Outputs
 
@@ -160,7 +175,8 @@ Detection CSV columns:
 | Column | Meaning |
 |---|---|
 | `detection_id` | 1-based detection ID within the image. |
-| `x`, `y`, `z` | Subpixel voxel coordinates. `z` is the stack axis. |
+| `x`, `y` | Subpixel voxel coordinates. |
+| `z` | Stack-axis coordinate. Present only for 3D models. |
 | `score` | SVM decision score, or Stage 1 score for Stage 1 pass-through models. |
 
 ## CLI Options
@@ -210,7 +226,7 @@ list, SNAPpy sweeps only the values listed in your config.
 | `dataset_root` | path or `null` | Usually supplied by `--dataset-root`; fixed-split root containing `train/` and `val/`. |
 | `optimization_mode` | `fixed_split` | Current implemented mode. Cross-validation is planned but not implemented. |
 | `match_distance` | positive number or `null` | Candidate-to-ground-truth matching radius in voxel units. Do not use with `match_distance_nm`. |
-| `match_distance_nm` | positive number or `null` | Candidate-to-ground-truth matching radius in nanometers. This is the default mode. Requires `xy_spacing_nm` and `z_spacing_nm`. Do not use with `match_distance`. |
+| `match_distance_nm` | positive number or `null` | Candidate-to-ground-truth matching radius in nanometers. This is the default mode. Requires `xy_spacing_nm`, and also `z_spacing_nm` for 3D. Do not use with `match_distance`. |
 | `stage1_detector_set` | `hmax` or `log` | Built-in Stage 1 detector family to sweep. |
 | `stage1_recipes` | list of recipe mappings | Optional explicit Stage 1 recipes. If supplied, these replace the built-in detector-set matrix. |
 | `stage2_feature_packs` | list | Feature packs swept in Stage 2. Defaults to `core_fit`, `core_contrast`, `core_morphology`, and `full_interpretable`. |
@@ -228,9 +244,9 @@ Exactly one of `match_distance` or `match_distance_nm` must be set.
 | `stage1_maxima_min_distances_nm` | list of positive numbers | Physical non-maximum-suppression distances in nanometers. These are swept as alternatives to voxel-unit `stage1_maxima_neighborhoods`, not paired with them. |
 | `stage1_hmax_multipliers` | list of positive numbers | h-max prominence threshold as multiplier times image noise estimate. |
 | `stage1_hmax_sigma_mode` | `robust` or `std` | Noise estimate used for h-max thresholding. |
-| `stage1_smoothing_sigmas` | list of positive numbers plus optional `off` | 3D Gaussian smoothing sigmas in voxel units. |
-| `stage1_smoothing_sigmas_nm` | list of positive numbers plus optional `off` | 3D Gaussian smoothing sigmas in nanometers. These are swept as alternatives to voxel-unit smoothing sigmas. |
-| `stage1_background_method` | `rolling_box_3d`, `slice_opening_2d`, `rolling_ball_2d`, or `rolling_ball_3d` | Background method swept when background radii are provided. |
+| `stage1_smoothing_sigmas` | list of positive numbers plus optional `off` | Gaussian smoothing sigmas in voxel units. |
+| `stage1_smoothing_sigmas_nm` | list of positive numbers plus optional `off` | Gaussian smoothing sigmas in nanometers. These are swept as alternatives to voxel-unit smoothing sigmas. |
+| `stage1_background_method` | `rolling_box_2d`, `rolling_box_3d`, `slice_opening_2d`, `rolling_ball_2d`, or `rolling_ball_3d` | Background method swept when background radii are provided. |
 | `stage1_background_radii` | list of positive numbers plus optional `off` | Background radii in voxel units. |
 | `stage1_background_radii_nm` | list of positive numbers plus optional `off` | Background radii in nanometers. These are swept as alternatives to voxel-unit background radii. |
 
@@ -274,8 +290,9 @@ These fields can appear in `pipeline_defaults` and, when needed, inside explicit
 
 | Key | Expected value | Meaning |
 |---|---|---|
+| `image_dimensionality` | `2` or `3` | Native image dimensionality. Use `2` for `y,x` images and `3` for `z,y,x` stacks. |
 | `xy_spacing_nm` | positive number | Physical xy pixel spacing. Required for optimization. |
-| `z_spacing_nm` | positive number | Physical z-step spacing. Required for optimization. |
+| `z_spacing_nm` | positive number or `null` | Physical z-step spacing. Required for 3D optimization; omit or set `null` for native 2D. |
 | `preproc_enabled` | `true` or `false` | Enables Stage 1 smoothing. |
 | `preproc_method` | `gaussian` or `none` | Smoothing method. |
 | `preproc_sigma` | positive number or `null` | Gaussian smoothing sigma in voxel units. |
@@ -295,14 +312,16 @@ These fields can appear in `pipeline_defaults` and, when needed, inside explicit
 | `threshold_value` | number or `null` | LoG response threshold. |
 | `h_max_sigma_multiplier` | positive number or `null` | h-max prominence multiplier. |
 | `h_max_sigma_mode` | `robust` or `std` | h-max noise estimate. |
-| `fit_method` | `2D (XY) + 1D (Z) Gaussian`, `3D Gaussian`, or `Distorted 3D Gaussian` | Candidate fitting mode. |
-| `fit_window` | positive odd integer | Cubic fitting window size in voxels. |
+| `fit_method` | `2D Gaussian`, `Distorted 2D Gaussian`, `2D (XY) + 1D (Z) Gaussian`, `3D Gaussian`, or `Distorted 3D Gaussian` | Candidate fitting mode. |
+| `fit_window` | positive odd integer | Square 2D or cubic 3D fitting window size in pixels/voxels. |
 | `fit_background_width` | non-negative integer | Perimeter width used for local mean-background subtraction before fitting. |
 | `fit_max_iterations` | positive integer | Maximum nonlinear fit iterations. |
 | `fit_tolerance` | positive number | Nonlinear fit convergence tolerance. |
 | `selected_features` | list | Advanced explicit feature list. Most users should use `stage2_feature_packs` instead. |
 
-The default fitting mode is `2D (XY) + 1D (Z) Gaussian`. Explicit recipes can use aliases `xy_z_gaussian`, `gaussian_3d`, and `distorted_gaussian_3d`.
+The default fitting mode is `2D (XY) + 1D (Z) Gaussian` for 3D configs.
+Explicit recipes can use aliases `gaussian_2d`, `distorted_gaussian_2d`,
+`xy_z_gaussian`, `gaussian_3d`, and `distorted_gaussian_3d`.
 
 ### Stage 2 Feature Packs
 
@@ -313,7 +332,9 @@ The default fitting mode is `2D (XY) + 1D (Z) Gaussian`. Explicit recipes can us
 | `core_morphology` | `core_fit` plus object morphology and distorted-Gaussian covariance features when compatible. |
 | `full_interpretable` | Complete scalar interpretable feature set. |
 
-Feature packs are resolved by fitting mode. For example, distorted-Gaussian covariance features are used only with distorted 3D Gaussian fitting.
+Feature packs are resolved by fitting mode. For example, distorted-Gaussian
+covariance features are used only with distorted 2D or distorted 3D Gaussian
+fitting. Z-only features are omitted for native 2D models.
 
 ### SVM Sweep
 
@@ -352,8 +373,8 @@ SNAPpy records a lightweight dataset profile in `model_config.json` and `model_s
 | `profiling.train_image_count` | positive integer | Number of training images sampled for the profile. |
 | `profiling.val_image_count` | positive integer | Number of validation images sampled for the profile. |
 | `profiling.gt_intensity_radius` | non-negative integer | Radius used when sampling image intensity near ground-truth coordinates. |
-| `profiling.sparse_label_mean_max` | positive number | Mean labels/image at or below this value are marked sparse. |
-| `profiling.dense_label_mean_min` | positive number | Mean labels/image at or above this value are marked dense. |
+| `profiling.sparse_label_mean_max` | positive number or `null` | Mean labels/image at or below this value are marked sparse. `null` uses dimensionality-aware defaults: 2D uses 16; 3D uses 64. |
+| `profiling.dense_label_mean_min` | positive number or `null` | Mean labels/image at or above this value are marked dense. `null` uses dimensionality-aware defaults: 2D uses 64; 3D uses 256. |
 | `profiling.stage1_augmentation_enabled` | `true` or `false` | Add profile-guided Stage 1 recipes. Default is `false`. |
 | `profiling.apply_runtime_pruning_to_explicit_recipes` | `true` or `false` | Apply backend candidate-limit guidance to explicit recipes. Default is `false`. |
 

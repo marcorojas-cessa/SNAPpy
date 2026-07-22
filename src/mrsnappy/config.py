@@ -13,6 +13,11 @@ from .features import FEATURE_PACK_DEFINITIONS, STAGE2_FEATURE_PACK_NAMES, resol
 
 FEATURE_PACKS: dict[str, dict[str, Any]] = deepcopy(FEATURE_PACK_DEFINITIONS)
 
+_DEFAULT_3D_SPARSE_LABEL_MEAN_MAX = 64.0
+_DEFAULT_3D_DENSE_LABEL_MEAN_MIN = 256.0
+_DEFAULT_2D_SPARSE_LABEL_MEAN_MAX = 16.0
+_DEFAULT_2D_DENSE_LABEL_MEAN_MIN = 64.0
+
 
 FITTING_MODES: dict[str, dict[str, Any]] = {
     "gaussian_2d": {"id": "gaussian_2d", "fit_method": "2D Gaussian", "fit_window": 7},
@@ -54,8 +59,8 @@ DEFAULT_NATIVE_CONFIG: dict[str, Any] = {
         "train_image_count": 8,
         "val_image_count": 4,
         "gt_intensity_radius": 1,
-        "sparse_label_mean_max": 64.0,
-        "dense_label_mean_min": 256.0,
+        "sparse_label_mean_max": None,
+        "dense_label_mean_min": None,
         "stage1_augmentation_enabled": False,
         "apply_runtime_pruning_to_explicit_recipes": False,
     },
@@ -311,7 +316,22 @@ def _stage1_detector_rows(cfg: dict[str, Any], detector_set: str) -> list[dict[s
     elif detector_set == "hmax":
         rows.extend(_hmax_stage1_grid(multipliers, maxima_options, sigma_mode=sigma_mode))
     if not rows:
-        raise ValueError(f"stage1_detector_set={detector_set!r} produced no Stage 1 recipes.")
+        empty_fields: list[str] = []
+        if not maxima_options:
+            empty_fields.append("stage1_maxima_neighborhoods or stage1_maxima_min_distances_nm")
+        if detector_set == "log":
+            if not cfg.get("stage1_log_sigmas", []) and not cfg.get("stage1_log_sigmas_nm", []):
+                empty_fields.append("stage1_log_sigmas or stage1_log_sigmas_nm")
+            if not thresholds:
+                empty_fields.append("stage1_log_thresholds")
+        elif detector_set == "hmax" and not multipliers:
+            empty_fields.append("stage1_hmax_multipliers")
+        detail = f" Empty required list field(s): {', '.join(empty_fields)}." if empty_fields else ""
+        raise ValueError(
+            f"stage1_detector_set={detector_set!r} produced no Stage 1 recipes."
+            f"{detail} When any stage1_* matrix key is declared, unspecified Stage 1 sweep lists are treated as empty; "
+            "provide every companion list needed for the selected detector."
+        )
     return rows
 
 
@@ -482,8 +502,21 @@ def _validate_profiling_semantics(cfg: dict[str, Any]) -> None:
     value = profiling.get("gt_intensity_radius")
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError("profiling.gt_intensity_radius must be a non-negative integer.")
-    sparse_max = _positive_finite_number(profiling.get("sparse_label_mean_max"), "profiling.sparse_label_mean_max")
-    dense_min = _positive_finite_number(profiling.get("dense_label_mean_min"), "profiling.dense_label_mean_min")
+    image_dimensionality = int(cfg.get("pipeline_defaults", {}).get("image_dimensionality", 3))
+    default_sparse = _DEFAULT_2D_SPARSE_LABEL_MEAN_MAX if image_dimensionality == 2 else _DEFAULT_3D_SPARSE_LABEL_MEAN_MAX
+    default_dense = _DEFAULT_2D_DENSE_LABEL_MEAN_MIN if image_dimensionality == 2 else _DEFAULT_3D_DENSE_LABEL_MEAN_MIN
+    sparse_value = profiling.get("sparse_label_mean_max")
+    dense_value = profiling.get("dense_label_mean_min")
+    sparse_max = (
+        default_sparse
+        if sparse_value is None
+        else _positive_finite_number(sparse_value, "profiling.sparse_label_mean_max")
+    )
+    dense_min = (
+        default_dense
+        if dense_value is None
+        else _positive_finite_number(dense_value, "profiling.dense_label_mean_min")
+    )
     if dense_min <= sparse_max:
         raise ValueError("profiling.dense_label_mean_min must be greater than profiling.sparse_label_mean_max.")
 

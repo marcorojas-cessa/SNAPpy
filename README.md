@@ -119,7 +119,7 @@ labeled_dataset/
 
 Each image must be either a 3D TIFF or, with `pipeline_defaults.image_dimensionality: 2`, a native 2D TIFF. For 3D images, each same-stem CSV must contain `x`, `y`, and `z` columns in voxel coordinates. For 2D images, CSV labels may contain `x,y`, `y,x`, or `axis-0,axis-1` style columns; internally SNAPpy stores 2D coordinates in image-axis order `(y,x)`.
 
-Detection CSVs are dimensionality-aware: 3D output uses `x,y,z,score`, while 2D output uses `x,y,score`.
+Detection CSVs are dimensionality-aware: 3D output uses `detection_id,x,y,z,score`, while 2D output uses `detection_id,x,y,score`.
 
 SNAPpy uses `train/` to fit the Stage 2 SVM. It uses `val/` to choose Stage 1 settings, Stage 2 feature/SVM settings, and the final SVM decision threshold. Held-out test scoring should be done outside SNAPpy by running `mrsnappy detect` and comparing detections to test labels.
 
@@ -153,12 +153,13 @@ detection_id,x,y,z,score
 ```
 
 Coordinates are voxel coordinates. `z` is the stack axis.
+For native 2D models, the same output omits the `z` column.
 
 ## How SNAPpy Works
 
 The short version:
 
-1. Read the 3D TIFF stack.
+1. Read the TIFF image or z-stack.
 2. Optionally subtract background.
 3. Normalize the image, usually by robust z-score.
 4. Optionally smooth the image for Stage 1 detection.
@@ -175,6 +176,7 @@ See [docs/workflow.md](docs/workflow.md) for the full method explanation and [do
 - [Installation](docs/installation.md)
 - [CLI/API and config reference](docs/cli_api.md)
 - [Workflow](docs/workflow.md)
+- [2D/3D fit and feature reference](docs/2d_3d_fit_feature_review.md)
 - [Model files](docs/models.md)
 - [Hardware guidance](docs/hardware.md)
 - [Release notes](CHANGELOG.md)

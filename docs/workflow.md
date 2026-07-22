@@ -1,16 +1,16 @@
 # SNAPpy Workflow
 
-SNAPpy detects bright 3D puncta with a two-stage workflow. Stage 1 is deliberately broad and finds candidate peaks. Stage 2 measures each candidate and uses an SVM to reject false positives.
+SNAPpy detects bright puncta in native 2D images and 3D z-stacks with a two-stage workflow. Stage 1 is deliberately broad and finds candidate peaks. Stage 2 measures each candidate and uses an SVM to reject false positives.
 
 ## Image Order
 
-SNAPpy reads each TIFF stack as a 3D array in `z, y, x` order. Public output coordinates are written as `x, y, z`.
+SNAPpy reads native 2D TIFF images in `y,x` order and 3D TIFF stacks in `z,y,x` order. Public output coordinates are written as `x,y` for 2D and `x,y,z` for 3D.
 
 For Stage 1, each recipe processes the image in this order:
 
 1. Optional background correction.
 2. Optional global normalization, usually robust z-score.
-3. Optional 3D Gaussian smoothing.
+3. Optional Gaussian smoothing.
 4. LoG or h-max local-maximum detection.
 5. Optional score-ordered physical non-maximum suppression when `maxima_min_distance_nm` is used.
 
@@ -37,14 +37,15 @@ Supported background methods:
 
 | Method | Meaning |
 |---|---|
-| `rolling_box_3d` | Fast 3D grayscale-opening approximation using a box footprint. This is the default optimizer method. |
+| `rolling_box_2d` | Fast 2D grayscale-opening approximation using a box footprint. On a 3D stack, it is applied independently to each z-slice. |
+| `rolling_box_3d` | Fast 3D grayscale-opening approximation using a box footprint. This is the default 3D optimizer method. |
 | `slice_opening_2d` | 2D morphological opening applied separately to each z-slice. |
-| `rolling_ball_2d` | scikit-image rolling-ball background estimation applied separately to each z-slice. |
+| `rolling_ball_2d` | scikit-image rolling-ball background estimation. On a 3D stack, it is applied independently to each z-slice. |
 | `rolling_ball_3d` | scikit-image n-dimensional rolling-ball background estimation. This is slower on large 3D stacks. |
 
 ## Candidate Fitting
 
-SNAPpy fits a local window around each candidate. The default fitting mode is:
+SNAPpy fits a local window around each candidate. The default 3D fitting mode is:
 
 ```text
 2D (XY) + 1D (Z) Gaussian
@@ -53,9 +54,17 @@ SNAPpy fits a local window around each candidate. The default fitting mode is:
 Other supported fitting modes are:
 
 ```text
+2D Gaussian
+Distorted 2D Gaussian
 3D Gaussian
 Distorted 3D Gaussian
 ```
+
+`2D Gaussian` is the standard axis-aligned 2D counterpart of `3D Gaussian`.
+`Distorted 2D Gaussian` is the covariance-enabled 2D counterpart of
+`Distorted 3D Gaussian`. `2D (XY) + 1D (Z) Gaussian` is 3D-only and fits an
+axis-aligned 2D Gaussian on the XY projection plus an axis-aligned 1D Gaussian
+on the Z profile; it does not use covariance terms.
 
 The local fit subtracts a mean perimeter background from the fitting window. `fit_background_width` controls the perimeter width. `fit_max_iterations` and `fit_tolerance` control nonlinear fit convergence.
 
@@ -70,11 +79,16 @@ Stage 2 feature packs are interpretable scalar measurements from each fitted can
 | `core_morphology` | `core_fit` plus thresholded-object morphology and distorted-Gaussian covariance features when available. |
 | `full_interpretable` | All implemented interpretable scalar features. |
 
-Feature packs are resolved by fitting mode. Features that do not apply to a fitting mode are omitted automatically.
+Feature packs are resolved by fitting mode and dimensionality. Features that do
+not apply to a fitting mode are omitted automatically. Native 2D models use
+area, boundary, circularity, and 2D sigma-product feature names; z-only
+features are omitted.
 
 ## Optimization
 
-SNAPpy currently implements `fixed_split` optimization. The user supplies `train/` and `val/` folders.
+SNAPpy currently implements `fixed_split` optimization. The user supplies
+`train/` and `val/` folders containing same-stem TIFF/CSV pairs. Native 2D
+images use 2D labels; 3D stacks use 3D labels.
 
 | Split | Used for |
 |---|---|
@@ -134,6 +148,16 @@ The final Stage 2 model is selected from recipes within `optimizer.stage2_f1_tol
 
 If a shortlisted Stage 1 recipe produces only positive training candidates, SNAPpy evaluates it as `stage1_pass_through`. This is not a feature pack. It uses preprocessing, local-maximum detection, fitting, and no SVM.
 
+### Validation With Empty Ground-Truth Images
+
+For Stage 2 model selection, empty-GT validation images still affect precision
+and F1. An empty-GT image with no detections receives precision/F1 of `1.0` for
+that image, while an empty-GT image with detections receives precision/F1 of
+`0.0`. Empty-GT images are excluded from mean recall because recall is
+undefined with no ground truth. Optimized model summaries and
+`model_config.json` report `n_labeled_images` and `n_empty_gt_images` for the
+validation split.
+
 ## Detection
 
 `mrsnappy detect` loads `model.joblib`, applies the selected Stage 1 recipe, extracts the selected Stage 2 features if the model uses an SVM, applies the saved decision threshold, and writes final detections.
@@ -142,6 +166,12 @@ Detection output contains:
 
 ```text
 detection_id,x,y,z,score
+```
+
+Native 2D detections omit the `z` column:
+
+```text
+detection_id,x,y,score
 ```
 
 ## Caching

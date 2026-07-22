@@ -113,6 +113,23 @@ def test_stage2_selection_metrics_handle_empty_gt_images_explicitly() -> None:
     assert metrics["f1_mean_image"] == pytest.approx(2.0 / 3.0)
 
 
+def test_stage2_selection_metrics_infer_2d_for_unshaped_empty_gt_images() -> None:
+    preds = {"labeled_hit": np.asarray([[5.0, 0.0]], dtype=np.float32)}
+    gts = {
+        "empty_clean": np.empty((0,), dtype=np.float32),
+        "labeled_hit": np.asarray([[5.0, 0.0]], dtype=np.float32),
+    }
+
+    metrics = pipeline.evaluate_predictions_for_selection(preds, gts, match_distance=0.1)
+
+    assert metrics["tp"] == 1
+    assert metrics["fp"] == 0
+    assert metrics["fn"] == 0
+    assert metrics["n_labeled_images"] == 1
+    assert metrics["n_empty_gt_images"] == 1
+    assert metrics["f1_mean_image"] == pytest.approx(1.0)
+
+
 def test_svm_threshold_tuning_breaks_f1_ties_by_threshold_closest_to_zero() -> None:
     preds = {"img": np.asarray([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=np.float32)}
     scores = {"img": np.asarray([-2.0, 2.0], dtype=np.float32)}
@@ -340,6 +357,171 @@ def test_distortion_shape_features_use_named_rhos_and_physical_covariance() -> N
     assert features.loc[0, "rho_axial_energy"] == pytest.approx(0.13)
     assert 0.0 <= features.loc[0, "covariance_elongation"] <= 1.0
     assert 0.0 <= features.loc[0, "long_axis_z_alignment"] <= 1.0
+
+
+def test_distorted_3d_feature_table_handles_moments_fallback_rows() -> None:
+    base = {
+        "integrated_intensity": 10.0,
+        "background": 1.0,
+        "noise": 1.0,
+        "r_squared": 0.9,
+        "amplitude": 10.0,
+        "fit_amplitude": 10.0,
+        "voxel_amplitude": 10.0,
+        "sigma_x": 1.0,
+        "sigma_y": 1.0,
+        "sigma_z": 2.0,
+        "rho_xy": 0.4,
+        "rho_xz": -0.3,
+        "rho_yz": 0.2,
+    }
+    rows = [
+        {**base, "fit_method_id": "distorted_gaussian_3d"},
+        {**base, "fit_method_id": "moments", "rho_xy": 0.0, "rho_xz": 0.0, "rho_yz": 0.0},
+    ]
+    selected = ["rho_lateral_abs", "rho_axial_energy", "covariance_elongation", "long_axis_z_alignment"]
+
+    features = feature_table(
+        rows,
+        selected,
+        xy_spacing_nm=100.0,
+        z_spacing_nm=300.0,
+        image_dimensionality=3,
+    )
+
+    assert list(features.columns) == selected
+    assert features.loc[0, "rho_lateral_abs"] == pytest.approx(0.4)
+    assert features.loc[1, "rho_lateral_abs"] == pytest.approx(0.0)
+    assert features.loc[0, "rho_axial_energy"] == pytest.approx(0.13)
+    assert features.loc[1, "rho_axial_energy"] == pytest.approx(0.0)
+
+
+def test_distorted_2d_feature_table_handles_moments_fallback_rows() -> None:
+    base = {
+        "integrated_intensity": 10.0,
+        "background": 1.0,
+        "noise": 1.0,
+        "r_squared": 0.9,
+        "amplitude": 10.0,
+        "fit_amplitude": 10.0,
+        "voxel_amplitude": 10.0,
+        "sigma_x": 1.0,
+        "sigma_y": 2.0,
+        "sigma_z": np.nan,
+        "rho_xy": 0.4,
+        "rho_xz": 0.0,
+        "rho_yz": 0.0,
+    }
+    rows = [
+        {**base, "fit_method_id": "distorted_gaussian_2d"},
+        {**base, "fit_method_id": "moments", "rho_xy": 0.0},
+    ]
+    selected = ["rho_lateral_abs", "covariance_elongation"]
+
+    features = feature_table(
+        rows,
+        selected,
+        xy_spacing_nm=100.0,
+        image_dimensionality=2,
+    )
+
+    assert list(features.columns) == selected
+    assert features.loc[0, "rho_lateral_abs"] == pytest.approx(0.4)
+    assert features.loc[1, "rho_lateral_abs"] == pytest.approx(0.0)
+    assert 0.0 <= features.loc[0, "covariance_elongation"] <= 1.0
+    assert 0.0 <= features.loc[1, "covariance_elongation"] <= 1.0
+
+
+def test_plain_gaussian_feature_tables_do_not_expose_distortion_features_when_fit_method_is_explicit() -> None:
+    base = {
+        "fit_amplitude": 10.0,
+        "voxel_amplitude": 10.0,
+        "integrated_intensity": 10.0,
+        "background": 1.0,
+        "noise": 1.0,
+        "r_squared": 0.9,
+        "sigma_x": 1.0,
+        "sigma_y": 1.0,
+        "sigma_z": 2.0,
+        "rho_xy": 0.4,
+        "rho_xz": -0.3,
+        "rho_yz": 0.2,
+    }
+
+    features_3d = feature_table(
+        [{**base, "fit_method_id": "gaussian_3d"}],
+        xy_spacing_nm=100.0,
+        z_spacing_nm=300.0,
+        image_dimensionality=3,
+        fit_method="3D Gaussian",
+    )
+    features_2d = feature_table(
+        [{**base, "fit_method_id": "gaussian_2d", "sigma_z": np.nan, "rho_xz": 0.0, "rho_yz": 0.0}],
+        xy_spacing_nm=100.0,
+        image_dimensionality=2,
+        fit_method="2D Gaussian",
+    )
+
+    for feature in ("rho_lateral_abs", "rho_axial_energy", "covariance_elongation", "long_axis_z_alignment"):
+        assert feature not in features_3d.columns
+    for feature in ("rho_lateral_abs", "covariance_elongation"):
+        assert feature not in features_2d.columns
+
+
+def test_refine_candidates_moments_mix_still_supports_distorted_3d_feature_pack(monkeypatch) -> None:
+    z, y, x = np.indices((9, 9, 9), dtype=np.float32)
+    image = (
+        20.0 * np.exp(-(((z - 4.0) ** 2) + ((y - 4.0) ** 2) + ((x - 4.0) ** 2)) / 4.0)
+        + 15.0 * np.exp(-(((z - 6.0) ** 2) + ((y - 6.0) ** 2) + ((x - 6.0) ** 2)) / 4.0)
+    ).astype(np.float32)
+
+    def fake_fit_3d_distorted(data, center, max_iterations, tolerance):
+        return np.asarray(
+            [10.0, center[0], center[1], center[2], 1.2, 1.1, 1.0, 0.2, -0.3, 0.4],
+            dtype=np.float32,
+        ), 0.9
+
+    monkeypatch.setattr(fitting, "_fit_3d_distorted", fake_fit_3d_distorted)
+
+    result = fitting.refine_candidates(
+        image,
+        np.asarray([[4.0, 4.0, 4.0], [6.0, 6.0, 6.0]], dtype=np.float32),
+        np.asarray([1.0, 0.9], dtype=np.float32),
+        window_radius=3,
+        fit_method="Distorted 3D Gaussian",
+        fit_cfg={
+            "fit_method": "Distorted 3D Gaussian",
+            "fit_fallback_method": "moments",
+            "fit_background_width": 1,
+            "fit_max_iterations": 100,
+            "fit_tolerance": 1e-6,
+            "selected_features": [
+                "rho_lateral_abs",
+                "rho_axial_energy",
+                "covariance_elongation",
+                "long_axis_z_alignment",
+            ],
+        },
+        full_fit_limit=1,
+    )
+
+    assert [row["fit_method_id"] for row in result.table] == ["distorted_gaussian_3d", "moments"]
+    features = feature_table(
+        result.table,
+        ["rho_lateral_abs", "rho_axial_energy", "covariance_elongation", "long_axis_z_alignment"],
+        xy_spacing_nm=100.0,
+        z_spacing_nm=300.0,
+        image_dimensionality=3,
+        fit_method="Distorted 3D Gaussian",
+    )
+
+    assert list(features.columns) == [
+        "rho_lateral_abs",
+        "rho_axial_energy",
+        "covariance_elongation",
+        "long_axis_z_alignment",
+    ]
+    assert len(features) == 2
 
 
 def test_standard_2d_feature_table_reuses_names_voids_z_and_distortion_features() -> None:

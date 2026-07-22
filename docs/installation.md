@@ -46,6 +46,11 @@ python -m pip install "git+https://github.com/marcorojas-cessa/SNAPpy.git"
 
 SNAPpy does not require a GPU. For routine detection, use a modern CPU-only computer with at least 8-16 GB RAM; 16 GB or more is recommended for larger z-stacks or batch processing. See [hardware guidance](hardware.md) for details.
 
+SNAPpy depends on scikit-learn `>=1.7.2,<2.0`. The upper bound is intentional:
+SNAPpy model files store scikit-learn SVM pipelines in `model.joblib`, and
+major scikit-learn releases are not guaranteed to preserve pickle/joblib
+compatibility.
+
 On Windows, activate the environment with:
 
 ```powershell

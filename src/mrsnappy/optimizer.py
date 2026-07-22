@@ -65,6 +65,10 @@ _FITTING_MODE_SIMPLICITY_RANK = {
     "distorted 3d gaussian": 2.0,
 }
 _DEFAULT_FITTING_MODE = "2D (XY) + 1D (Z) Gaussian"
+_DEFAULT_3D_SPARSE_LABEL_MEAN_MAX = 64.0
+_DEFAULT_3D_DENSE_LABEL_MEAN_MIN = 256.0
+_DEFAULT_2D_SPARSE_LABEL_MEAN_MAX = 16.0
+_DEFAULT_2D_DENSE_LABEL_MEAN_MIN = 64.0
 _STAGE1_SCREEN_FIELDS = (
     "image_dimensionality",
     "xy_spacing_nm",
@@ -99,6 +103,18 @@ def _cfg_image_dimensionality(cfg: dict[str, Any]) -> int:
     if ndim not in {2, 3}:
         raise ValueError("pipeline_defaults.image_dimensionality must be either 2 or 3.")
     return ndim
+
+
+def _profile_density_thresholds(cfg: dict[str, Any]) -> tuple[float, float]:
+    profiling_cfg = cfg.get("profiling", {})
+    image_dimensionality = _cfg_image_dimensionality(cfg)
+    default_sparse = _DEFAULT_2D_SPARSE_LABEL_MEAN_MAX if image_dimensionality == 2 else _DEFAULT_3D_SPARSE_LABEL_MEAN_MAX
+    default_dense = _DEFAULT_2D_DENSE_LABEL_MEAN_MIN if image_dimensionality == 2 else _DEFAULT_3D_DENSE_LABEL_MEAN_MIN
+    sparse_value = profiling_cfg.get("sparse_label_mean_max")
+    dense_value = profiling_cfg.get("dense_label_mean_min")
+    sparse_max = default_sparse if sparse_value is None else float(sparse_value)
+    dense_min = default_dense if dense_value is None else float(dense_value)
+    return sparse_max, dense_min
 
 
 def _match_distance_kwargs(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -642,6 +658,23 @@ def _stage1_pass_through_recipe(stage1_recipe: dict[str, Any], cfg: dict[str, An
     return recipe
 
 
+def _untrainable_stage1_recipe(stage1_recipe: dict[str, Any], cfg: dict[str, Any], reason: str) -> dict[str, Any]:
+    reason = str(reason).strip().lower()
+    if reason not in {"no_training_candidates", "no_true_positive_training_candidates"}:
+        raise ValueError(f"Unsupported untrainable Stage 1 reason: {reason!r}")
+    recipe = deepcopy(stage1_recipe)
+    recipe["stage1_recipe_id"] = stage1_recipe["recipe_id"]
+    recipe["fit_method"] = _simplest_fitting_mode(stage1_recipe, cfg)
+    recipe["feature_pack_name"] = "not_applicable"
+    recipe["selected_features"] = []
+    recipe["feature_cache_features"] = []
+    recipe["model_type"] = "skipped"
+    recipe["stage1_train_label_status"] = reason
+    recipe["stage2_skip_reason"] = reason
+    recipe["recipe_id"] = f"{stage1_recipe['recipe_id']}_{reason}"
+    return recipe
+
+
 def _annotate_stage1_train_label_status(stage1_shortlist: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
     if stage1_shortlist.empty:
         return stage1_shortlist.copy()
@@ -684,7 +717,8 @@ def _expand_stage2_shortlist(
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for _, stage1_row in stage1_shortlist.iterrows():
-        if str(stage1_row.get("stage1_train_label_status", "")).strip().lower() == "all_positive_stage1":
+        label_status = str(stage1_row.get("stage1_train_label_status", "")).strip().lower()
+        if label_status == "all_positive_stage1":
             recipe = _stage1_pass_through_recipe(deepcopy(stage1_row["recipe"]), cfg)
             row = stage1_row.drop(labels=["recipe"]).to_dict()
             row["stage1_recipe_id"] = stage1_row["recipe_id"]
@@ -692,6 +726,17 @@ def _expand_stage2_shortlist(
             row["feature_pack_name"] = recipe.get("feature_pack_name")
             row["fitting_mode"] = recipe.get("fit_method")
             row["model_type"] = "stage1_pass_through"
+            row["recipe"] = deepcopy(recipe)
+            rows.append(row)
+            continue
+        if label_status in {"no_training_candidates", "no_true_positive_training_candidates"}:
+            recipe = _untrainable_stage1_recipe(deepcopy(stage1_row["recipe"]), cfg, label_status)
+            row = stage1_row.drop(labels=["recipe"]).to_dict()
+            row["stage1_recipe_id"] = stage1_row["recipe_id"]
+            row["recipe_id"] = recipe["recipe_id"]
+            row["feature_pack_name"] = recipe.get("feature_pack_name")
+            row["fitting_mode"] = recipe.get("fit_method")
+            row["model_type"] = "skipped"
             row["recipe"] = deepcopy(recipe)
             rows.append(row)
             continue
@@ -1041,6 +1086,9 @@ def _stage1_score_payload(winner: pd.Series) -> dict[str, Any]:
 def _validation_metric_payload(winner: pd.Series) -> dict[str, Any]:
     return {
         "selection_metric": "mean per-image F1",
+        "n_images": int(winner.get("val_n_images", 0)),
+        "n_labeled_images": int(winner.get("val_n_labeled_images", 0)),
+        "n_empty_gt_images": int(winner.get("val_n_empty_gt_images", 0)),
         "tp": int(winner.get("val_tp", 0)),
         "fp": int(winner.get("val_fp", 0)),
         "fn": int(winner.get("val_fn", 0)),
@@ -1379,6 +1427,9 @@ def _summary_markdown_lines(
             f"- Selected feature count: `{len(stage2_winner['selected_features'])}`",
             f"- SVM parameters: `{json.dumps(stage2_winner['svm'], sort_keys=True) if stage2_winner['svm'] is not None else 'none'}`",
             f"- Decision threshold: `{_format_summary_value(stage2_winner['decision_threshold'], digits=6)}`",
+            f"- Validation images: `{stage2_winner['validation_metrics'].get('n_images', 0)}`",
+            f"- Validation labeled images: `{stage2_winner['validation_metrics'].get('n_labeled_images', 0)}`",
+            f"- Validation empty-GT images: `{stage2_winner['validation_metrics'].get('n_empty_gt_images', 0)}`",
             f"- Validation F1, mean per image: `{stage2_winner['validation_metrics']['f1_mean_image']:.6f}`",
             f"- Validation precision, mean per image: `{stage2_winner['validation_metrics']['precision_mean_image']:.6f}`",
             f"- Validation recall, mean per image: `{stage2_winner['validation_metrics']['recall_mean_image']:.6f}`",
@@ -1582,8 +1633,7 @@ def _profile_dataset(cfg: dict[str, Any]) -> dict[str, Any]:
         gt_intensities.extend(_sample_gt_intensities(volume, gt))
 
     mean_labels = float(np.mean(label_counts)) if label_counts else 0.0
-    sparse_max = float(profiling_cfg.get("sparse_label_mean_max", 64.0))
-    dense_min = float(profiling_cfg.get("dense_label_mean_min", 256.0))
+    sparse_max, dense_min = _profile_density_thresholds(cfg)
     if mean_labels <= sparse_max:
         density_regime = "sparse"
     elif mean_labels >= dense_min:
@@ -1614,6 +1664,9 @@ def _profile_dataset(cfg: dict[str, Any]) -> dict[str, Any]:
         "label_count_median": _safe_quantile(label_counts, 0.5),
         "label_count_p90": _safe_quantile(label_counts, 0.9),
         "label_count_max": max(label_counts) if label_counts else 0.0,
+        "image_dimensionality": _cfg_image_dimensionality(cfg),
+        "density_sparse_label_mean_max": sparse_max,
+        "density_dense_label_mean_min": dense_min,
         "image_p50_median": _safe_quantile(p50s, 0.5),
         "image_p90_median": median_p90,
         "image_p99_median": median_p99,
@@ -1651,6 +1704,7 @@ def _augment_stage1_recipes(cfg: dict[str, Any], profile: dict[str, Any]) -> lis
     density = str(profile.get("density_regime", "moderate"))
     contrast = str(profile.get("contrast_regime", "moderate"))
     background = str(profile.get("background_regime", "stable"))
+    box_background_method = "rolling_box_2d" if _cfg_image_dimensionality(cfg) == 2 else "rolling_box_3d"
     additions: list[dict[str, Any]] = []
 
     if density == "sparse":
@@ -1663,7 +1717,7 @@ def _augment_stage1_recipes(cfg: dict[str, Any], profile: dict[str, Any]) -> lis
                     "norm_enabled": True,
                     "norm_method": "robust_z_score",
                     "background_enabled": True,
-                    "background_method": "rolling_box_3d",
+                    "background_method": box_background_method,
                     "background_param": 10.0,
                     "background_clip": False,
                 },
@@ -1674,7 +1728,7 @@ def _augment_stage1_recipes(cfg: dict[str, Any], profile: dict[str, Any]) -> lis
                     "norm_enabled": True,
                     "norm_method": "robust_z_score",
                     "background_enabled": True,
-                    "background_method": "rolling_box_3d",
+                    "background_method": box_background_method,
                     "background_param": 20.0,
                     "background_clip": False,
                 },
@@ -1685,7 +1739,7 @@ def _augment_stage1_recipes(cfg: dict[str, Any], profile: dict[str, Any]) -> lis
                     "norm_enabled": True,
                     "norm_method": "robust_z_score",
                     "background_enabled": True,
-                    "background_method": "rolling_box_3d",
+                    "background_method": box_background_method,
                     "background_param": 10.0,
                     "background_clip": False,
                 },
@@ -1701,7 +1755,7 @@ def _augment_stage1_recipes(cfg: dict[str, Any], profile: dict[str, Any]) -> lis
                     "norm_enabled": True,
                     "norm_method": "robust_z_score",
                     "background_enabled": True,
-                    "background_method": "rolling_box_3d",
+                    "background_method": box_background_method,
                     "background_param": 20.0,
                     "background_clip": False,
                 },
@@ -1712,7 +1766,7 @@ def _augment_stage1_recipes(cfg: dict[str, Any], profile: dict[str, Any]) -> lis
                     "norm_enabled": True,
                     "norm_method": "robust_z_score",
                     "background_enabled": True,
-                    "background_method": "rolling_box_3d",
+                    "background_method": box_background_method,
                     "background_param": 20.0,
                     "background_clip": False,
                 },
@@ -2088,6 +2142,7 @@ def optimize_native_dataset(
     stage2_rows = []
     for stage2_index, (_, row) in enumerate(shortlist.iterrows(), start=1):
         recipe = row["recipe"]
+        skip_reason = str(recipe.get("stage2_skip_reason", "")).strip().lower()
         _append_jsonl(
             stage2_progress_path,
             {
@@ -2099,24 +2154,15 @@ def optimize_native_dataset(
                 "feature_pack_name": recipe.get("feature_pack_name"),
             },
         )
-        try:
-            result = _evaluate_stage2_recipe(recipe, cfg, run_dir / "stage2")
-        except ValueError as exc:
-            message = str(exc)
-            no_training_candidates = "generated no training candidates" in message
-            no_true_positive = "generated no true-positive training candidates" in message
-            one_class_error = "number of classes has to be greater than one" in message or "one class" in message.lower()
-            if not no_training_candidates and not no_true_positive and not one_class_error:
-                raise
-            if no_training_candidates:
-                status = "skipped_no_training_candidates"
-                reason = "no_training_candidates"
-            elif no_true_positive:
-                status = "skipped_no_true_positive_training_candidates"
-                reason = "no_true_positive_training_candidates"
+        if skip_reason in {"no_training_candidates", "no_true_positive_training_candidates"}:
+            status = f"skipped_{skip_reason}"
+            if skip_reason == "no_training_candidates":
+                message = f"Stage 1 recipe {row.get('stage1_recipe_id', '')} generated no training candidates."
             else:
-                status = "skipped_one_class_training_labels"
-                reason = "one_class_training_labels"
+                message = (
+                    f"Stage 1 recipe {row.get('stage1_recipe_id', '')} generated no true-positive training "
+                    "candidates."
+                )
             result = {
                 "recipe_id": str(recipe["recipe_id"]),
                 "model_path": "",
@@ -2140,10 +2186,56 @@ def optimize_native_dataset(
                     "stage2_index": int(stage2_index),
                     "stage2_recipe_count": int(len(shortlist)),
                     "recipe_id": str(recipe["recipe_id"]),
-                    "reason": reason,
+                    "reason": skip_reason,
                     "error": message,
                 },
             )
+        else:
+            try:
+                result = _evaluate_stage2_recipe(recipe, cfg, run_dir / "stage2")
+            except ValueError as exc:
+                message = str(exc)
+                no_training_candidates = "generated no training candidates" in message
+                no_true_positive = "generated no true-positive training candidates" in message
+                one_class_error = "number of classes has to be greater than one" in message or "one class" in message.lower()
+                if not no_training_candidates and not no_true_positive and not one_class_error:
+                    raise
+                if no_training_candidates:
+                    status = "skipped_no_training_candidates"
+                    reason = "no_training_candidates"
+                elif no_true_positive:
+                    status = "skipped_no_true_positive_training_candidates"
+                    reason = "no_true_positive_training_candidates"
+                else:
+                    status = "skipped_one_class_training_labels"
+                    reason = "one_class_training_labels"
+                result = {
+                    "recipe_id": str(recipe["recipe_id"]),
+                    "model_path": "",
+                    "stage2_status": status,
+                    "stage2_error": message,
+                    "val_f1": 0.0,
+                    "val_precision": 0.0,
+                    "val_recall": 0.0,
+                    "val_f1_mean_image": 0.0,
+                    "val_precision_mean_image": 0.0,
+                    "val_recall_mean_image": 0.0,
+                    "val_f1_pooled": 0.0,
+                    "val_precision_pooled": 0.0,
+                    "val_recall_pooled": 0.0,
+                    "recipe": deepcopy(recipe),
+                }
+                _append_jsonl(
+                    stage2_progress_path,
+                    {
+                        "event": "stage2_recipe_skipped",
+                        "stage2_index": int(stage2_index),
+                        "stage2_recipe_count": int(len(shortlist)),
+                        "recipe_id": str(recipe["recipe_id"]),
+                        "reason": reason,
+                        "error": message,
+                    },
+                )
         stage2_rows.append(result)
         _append_jsonl(
             stage2_progress_path,
