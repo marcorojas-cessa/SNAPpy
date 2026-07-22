@@ -56,6 +56,7 @@ _DEFAULT_FIT_CACHE_ENTRIES = 512
 _LABEL_CACHE: "OrderedDict[str, np.ndarray]" = OrderedDict()
 _DEFAULT_LABEL_CACHE_ENTRIES = 4096
 _PROCESSING_BASE_KEY_FIELDS = (
+    "image_dimensionality",
     "xy_spacing_nm",
     "z_spacing_nm",
     "norm_enabled",
@@ -112,6 +113,21 @@ def ensure_dir(path: str | Path) -> Path:
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _recipe_image_dimensionality(pipeline_cfg: dict[str, Any], fallback: int | None = None) -> int:
+    value = pipeline_cfg.get("image_dimensionality", fallback if fallback is not None else 3)
+    try:
+        ndim = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("image_dimensionality must be either 2 or 3.") from exc
+    if ndim not in {2, 3}:
+        raise ValueError("image_dimensionality must be either 2 or 3.")
+    return ndim
+
+
+def _empty_coords(ndim: int) -> np.ndarray:
+    return np.empty((0, int(ndim)), dtype=np.float32)
 
 
 def _match_spacing_array(match_spacing_nm: tuple[float, ...] | None, ndim: int) -> np.ndarray | None:
@@ -681,8 +697,14 @@ def detect_image(image_path: str | Path, pipeline_cfg: dict[str, Any], label_cou
             _FIT_CACHE.move_to_end(cache_key)
             return _copy_fit_payload(cached, selected_features)
 
-    coords, scores = _load_stage1_candidates(image_path, pipeline_cfg)
     feature_volume = _load_processing_base(image_path, pipeline_cfg)
+    declared_ndim = _recipe_image_dimensionality(pipeline_cfg, fallback=feature_volume.ndim)
+    if declared_ndim != feature_volume.ndim:
+        raise ValueError(
+            "image_dimensionality does not match input image: "
+            f"config declares {declared_ndim}D, image is {feature_volume.ndim}D."
+        )
+    coords, scores = _load_stage1_candidates(image_path, pipeline_cfg)
     coords, scores = _prune_candidates_for_fit(feature_volume, coords, scores, pipeline_cfg, label_count=label_count)
     full_fit_limit = _full_fit_limit_for_candidates(pipeline_cfg, label_count=label_count)
     fit_window = int(pipeline_cfg.get("fit_window", 7) or 7)
@@ -703,6 +725,7 @@ def detect_image(image_path: str | Path, pipeline_cfg: dict[str, Any], label_cou
         feature_cache_features,
         xy_spacing_nm=pipeline_cfg.get("xy_spacing_nm"),
         z_spacing_nm=pipeline_cfg.get("z_spacing_nm"),
+        image_dimensionality=feature_volume.ndim,
     )
     payload = (np.asarray(fit.coords, dtype=np.float32), np.asarray(scores, dtype=np.float32), all_features)
     if bool(pipeline_cfg.get("fit_cache_enabled", True)):
@@ -826,7 +849,7 @@ def _predict_metas_scored(
         image_stem = Path(str(meta["image_path"])).stem
         coords = np.asarray(meta["coords"], dtype=np.float32)
         if len(coords) == 0:
-            preds[image_stem] = np.empty((0, 3), dtype=np.float32)
+            preds[image_stem] = _empty_coords(coords.shape[1] if coords.ndim == 2 else 3)
             scores_map[image_stem] = np.empty((0,), dtype=np.float32)
         else:
             features = meta["features"][selected_features].to_numpy(dtype=np.float32)
@@ -1048,7 +1071,7 @@ def predict_image(
         raise ValueError("Prediction requires a pipeline recipe, either embedded in the model or supplied by config.")
     coords, _, feats = detect_image(image_path, recipe)
     if len(coords) == 0:
-        return np.empty((0, 3), dtype=np.float32), np.empty((0,), dtype=np.float32)
+        return _empty_coords(coords.shape[1] if coords.ndim == 2 else _recipe_image_dimensionality(recipe)), np.empty((0,), dtype=np.float32)
     features = feats[trained.selected_features].to_numpy(dtype=np.float32)
     model = trained.model
     if hasattr(model, "decision_function"):
@@ -1069,7 +1092,7 @@ def predict_image_scored(image_path: str | Path, recipe: dict[str, Any] | None, 
         raise ValueError("Prediction requires a pipeline recipe, either embedded in the model or supplied by config.")
     coords, _, feats = detect_image(image_path, recipe)
     if len(coords) == 0:
-        return np.empty((0, 3), dtype=np.float32), np.empty((0,), dtype=np.float32)
+        return _empty_coords(coords.shape[1] if coords.ndim == 2 else _recipe_image_dimensionality(recipe)), np.empty((0,), dtype=np.float32)
     features = feats[trained.selected_features].to_numpy(dtype=np.float32)
     model = trained.model
     if hasattr(model, "decision_function"):
@@ -1163,8 +1186,9 @@ def evaluate_predictions(
 ) -> dict[str, float]:
     totals = {"tp": 0, "fp": 0, "fn": 0}
     for key in sorted(gts):
-        pred = preds.get(key, np.empty((0, 3), dtype=np.float32))
         gt = gts[key]
+        gt_ndim = gt.shape[1] if np.asarray(gt).ndim == 2 else 3
+        pred = preds.get(key, _empty_coords(gt_ndim))
         tp, fp, fn = match_points(pred, gt, match_distance, match_spacing_nm=match_spacing_nm)
         totals["tp"] += tp
         totals["fp"] += fp
@@ -1195,8 +1219,9 @@ def evaluate_predictions_for_selection(
     totals = {"tp": 0, "fp": 0, "fn": 0}
     per_image_metrics: list[dict[str, float | bool]] = []
     for key in sorted(gts):
-        pred = preds.get(key, np.empty((0, 3), dtype=np.float32))
         gt = gts[key]
+        gt_ndim = gt.shape[1] if np.asarray(gt).ndim == 2 else 3
+        pred = preds.get(key, _empty_coords(gt_ndim))
         tp, fp, fn = match_points(pred, gt, match_distance, match_spacing_nm=match_spacing_nm)
         totals["tp"] += tp
         totals["fp"] += fp

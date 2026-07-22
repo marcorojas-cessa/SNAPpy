@@ -4,6 +4,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import pytest
+import tifffile
 
 import mrsnappy.fitting as fitting
 import mrsnappy.pipeline as pipeline
@@ -318,6 +319,7 @@ def test_distorted_3d_rho_features_match_covariance_names(monkeypatch) -> None:
 def test_distortion_shape_features_use_named_rhos_and_physical_covariance() -> None:
     rows = [
         {
+            "fit_method_id": "distorted_gaussian_3d",
             "integrated_intensity": 10.0,
             "background": 1.0,
             "snr": 10.0,
@@ -338,6 +340,297 @@ def test_distortion_shape_features_use_named_rhos_and_physical_covariance() -> N
     assert features.loc[0, "rho_axial_energy"] == pytest.approx(0.13)
     assert 0.0 <= features.loc[0, "covariance_elongation"] <= 1.0
     assert 0.0 <= features.loc[0, "long_axis_z_alignment"] <= 1.0
+
+
+def test_standard_2d_feature_table_reuses_names_voids_z_and_distortion_features() -> None:
+    rows = [
+        {
+            "fit_method_id": "gaussian_2d",
+            "fit_amplitude": 10.0,
+            "voxel_amplitude": 12.0,
+            "integrated_intensity": 25.0,
+            "background": 2.0,
+            "noise": 1.0,
+            "r_squared": 0.8,
+            "sigma_x": 2.0,
+            "sigma_y": 3.0,
+            "sigma_z": np.nan,
+            "rho_xy": 0.25,
+            "rho_xz": 0.0,
+            "rho_yz": 0.0,
+            "residual_rmse": 0.1,
+            "residual_energy_norm": 0.2,
+        }
+    ]
+
+    features = feature_table(rows, xy_spacing_nm=100.0, image_dimensionality=2)
+
+    assert features.loc[0, "sigma_x_nm"] == pytest.approx(200.0)
+    assert features.loc[0, "sigma_y_nm"] == pytest.approx(300.0)
+    assert features.loc[0, "sigma_total_nm"] == pytest.approx(500.0)
+    assert features.loc[0, "sigma_product_nm2"] == pytest.approx(60000.0)
+    assert "sigma_product_nm3" not in features.columns
+    assert features.loc[0, "quality_vs_size_penalty"] == pytest.approx(0.8 / 500.0)
+    for incompatible in ("rho_lateral_abs", "covariance_elongation"):
+        assert incompatible not in features.columns
+    for z_only in ("sigma_z_nm", "sigma_axial_ratio", "rho_axial_energy", "long_axis_z_alignment"):
+        assert z_only not in features.columns
+
+
+def test_distorted_2d_feature_table_exposes_lateral_covariance_features() -> None:
+    rows = [
+        {
+            "fit_method_id": "distorted_gaussian_2d",
+            "fit_amplitude": 10.0,
+            "voxel_amplitude": 12.0,
+            "integrated_intensity": 25.0,
+            "background": 2.0,
+            "noise": 1.0,
+            "r_squared": 0.8,
+            "sigma_x": 2.0,
+            "sigma_y": 3.0,
+            "sigma_z": np.nan,
+            "rho_xy": 0.25,
+            "rho_xz": 0.0,
+            "rho_yz": 0.0,
+            "residual_rmse": 0.1,
+            "residual_energy_norm": 0.2,
+        }
+    ]
+
+    features = feature_table(rows, xy_spacing_nm=100.0, image_dimensionality=2)
+
+    assert features.loc[0, "rho_lateral_abs"] == pytest.approx(0.25)
+    assert 0.0 <= features.loc[0, "covariance_elongation"] <= 1.0
+    for z_only in ("sigma_z_nm", "sigma_axial_ratio", "rho_axial_energy", "long_axis_z_alignment"):
+        assert z_only not in features.columns
+
+
+def test_2d_feature_table_rejects_explicit_z_only_features() -> None:
+    rows = [
+        {
+            "fit_method_id": "gaussian_2d",
+            "fit_amplitude": 1.0,
+            "integrated_intensity": 1.0,
+            "background": 1.0,
+            "noise": 1.0,
+            "r_squared": 1.0,
+            "sigma_x": 1.0,
+            "sigma_y": 1.0,
+            "sigma_z": np.nan,
+        }
+    ]
+
+    with pytest.raises(ValueError, match="sigma_z_nm"):
+        feature_table(rows, ["sigma_z_nm"], xy_spacing_nm=100.0, image_dimensionality=2)
+
+
+def test_2d_feature_table_rejects_old_3d_morphology_feature_names() -> None:
+    rows = [
+        {
+            "fit_method_id": "gaussian_2d",
+            "fit_amplitude": 1.0,
+            "integrated_intensity": 1.0,
+            "background": 1.0,
+            "noise": 1.0,
+            "r_squared": 1.0,
+            "sigma_x": 1.0,
+            "sigma_y": 1.0,
+            "sigma_z": np.nan,
+            "component_sphericity_3d": 0.5,
+        }
+    ]
+
+    with pytest.raises(ValueError, match="component_sphericity_3d"):
+        feature_table(rows, ["component_sphericity_3d"], xy_spacing_nm=100.0, image_dimensionality=2)
+
+
+def test_refine_candidates_computes_native_2d_coordinates_contrast_and_morphology() -> None:
+    y, x = np.indices((13, 13), dtype=np.float32)
+    image = (20.0 * np.exp(-(((y - 6.0) ** 2) + ((x - 7.0) ** 2)) / 4.0)).astype(np.float32)
+
+    result = fitting.refine_candidates(
+        image,
+        np.asarray([[6.0, 7.0]], dtype=np.float32),
+        np.asarray([1.0], dtype=np.float32),
+        window_radius=3,
+        fit_method="2D Gaussian",
+        fit_cfg={
+            "fit_method": "2D Gaussian",
+            "fit_background_width": 1,
+            "fit_max_iterations": 100,
+            "fit_tolerance": 1e-6,
+            "xy_spacing_nm": 100.0,
+            "selected_features": [
+                "core_mean",
+                "core_minus_shell",
+                "halfspace_absdiff_max",
+                "component_pixel_area",
+                "component_boundary_px",
+                "component_circularity_2d",
+                "component_centroid_fit_distance_nm",
+            ],
+        },
+    )
+
+    assert result.coords.shape == (1, 2)
+    row = result.table[0]
+    assert "z" not in row
+    assert row["y"] == pytest.approx(6.0, abs=0.5)
+    assert row["x"] == pytest.approx(7.0, abs=0.5)
+    assert row["core_mean"] > row["shell_mean"]
+    assert row["component_pixel_area"] > 0
+    assert row["component_boundary_px"] > 0
+    assert 0.0 <= row["component_circularity_2d"] <= 1.0
+    assert row["component_centroid_fit_distance_nm"] >= 0.0
+
+
+def test_fit_patch_native_2d_rejects_3d_only_fit_methods() -> None:
+    image = np.ones((7, 7), dtype=np.float32)
+    center = np.asarray([4.0, 4.0], dtype=np.float32)
+
+    for fit_method in ("2D (XY) + 1D (Z) Gaussian", "3D Gaussian", "Distorted 3D Gaussian"):
+        with pytest.raises(ValueError, match="incompatible with native 2D images"):
+            fitting._fit_patch(image, center, {"fit_method": fit_method})
+
+
+def test_fit_patch_native_3d_rejects_2d_fit_methods() -> None:
+    image = np.ones((5, 7, 7), dtype=np.float32)
+    center = np.asarray([3.0, 4.0, 4.0], dtype=np.float32)
+
+    for fit_method in ("2D Gaussian", "Distorted 2D Gaussian"):
+        with pytest.raises(ValueError, match="incompatible with native 3D images"):
+            fitting._fit_patch(image, center, {"fit_method": fit_method})
+
+
+def test_fit_patch_native_2d_standard_and_distorted_gaussian_dispatch(monkeypatch) -> None:
+    image = np.ones((7, 7), dtype=np.float32)
+    center = np.asarray([4.0, 4.0], dtype=np.float32)
+    calls = {"axis": 0, "distorted": 0}
+
+    def fake_axis(data, center_guess, max_iterations, tolerance):
+        calls["axis"] += 1
+        return np.asarray([10.0, center_guess[0], center_guess[1], 1.2, 1.3], dtype=np.float32), 0.8
+
+    def fake_distorted(data, center_guess, max_iterations, tolerance):
+        calls["distorted"] += 1
+        return np.asarray([10.0, center_guess[0], center_guess[1], 1.2, 1.3, 0.4], dtype=np.float32), 0.9
+
+    monkeypatch.setattr(fitting, "_fit_2d_axis_aligned", fake_axis)
+    monkeypatch.setattr(fitting, "_fit_2d_distorted", fake_distorted)
+
+    standard = fitting._fit_patch(image, center, {"fit_method": "2D Gaussian"})
+    distorted = fitting._fit_patch(image, center, {"fit_method": "Distorted 2D Gaussian"})
+
+    assert calls == {"axis": 1, "distorted": 1}
+    assert standard["fit_method_id"] == "gaussian_2d"
+    np.testing.assert_array_equal(standard["rho"], np.asarray([0.0, 0.0, 0.0], dtype=np.float32))
+    assert distorted["fit_method_id"] == "distorted_gaussian_2d"
+    np.testing.assert_array_equal(distorted["rho"], np.asarray([0.4, 0.0, 0.0], dtype=np.float32))
+
+
+def test_fit_patch_native_2d_honors_moments_fallback() -> None:
+    y, x = np.indices((7, 7), dtype=np.float32)
+    image = (10.0 * np.exp(-(((y - 3.0) ** 2) + ((x - 4.0) ** 2)) / 4.0)).astype(np.float32)
+
+    result = fitting._fit_patch(image, np.asarray([4.0, 5.0], dtype=np.float32), {"fit_method": "moments"})
+
+    assert result["fit_method_id"] == "moments"
+    assert "residual_rmse" not in result
+    assert np.asarray(result["center"]).shape == (2,)
+    assert np.asarray(result["sigma"]).shape == (3,)
+    assert np.isnan(np.asarray(result["sigma"])[0])
+
+
+def test_refine_candidates_native_2d_respects_full_fit_limit_moments_fallback(monkeypatch) -> None:
+    y, x = np.indices((15, 15), dtype=np.float32)
+    image = (
+        20.0 * np.exp(-(((y - 5.0) ** 2) + ((x - 5.0) ** 2)) / 4.0)
+        + 15.0 * np.exp(-(((y - 10.0) ** 2) + ((x - 10.0) ** 2)) / 4.0)
+    ).astype(np.float32)
+    calls = {"count": 0}
+    original_fit_2d = fitting._fit_2d_axis_aligned
+
+    def wrapped_fit_2d(*args, **kwargs):
+        calls["count"] += 1
+        return original_fit_2d(*args, **kwargs)
+
+    monkeypatch.setattr(fitting, "_fit_2d_axis_aligned", wrapped_fit_2d)
+
+    result = fitting.refine_candidates(
+        image,
+        np.asarray([[5.0, 5.0], [10.0, 10.0]], dtype=np.float32),
+        np.asarray([1.0, 0.9], dtype=np.float32),
+        window_radius=3,
+        fit_method="2D Gaussian",
+        fit_cfg={
+            "fit_method": "2D Gaussian",
+            "fit_fallback_method": "moments",
+            "fit_background_width": 1,
+            "fit_max_iterations": 100,
+            "fit_tolerance": 1e-6,
+            "selected_features": ["fit_snr"],
+        },
+        full_fit_limit=1,
+    )
+
+    assert calls["count"] == 1
+    assert [row["fit_method_id"] for row in result.table] == ["gaussian_2d", "moments"]
+
+
+def test_detect_image_runs_native_2d_pipeline_without_z_spacing(tmp_path) -> None:
+    y, x = np.indices((31, 31), dtype=np.float32)
+    image = (2.0 + 50.0 * np.exp(-(((y - 15.0) ** 2) + ((x - 16.0) ** 2)) / 8.0)).astype(np.float32)
+    image_path = tmp_path / "spot_2d.tif"
+    tifffile.imwrite(image_path, image)
+
+    coords, scores, features = pipeline.detect_image(
+        image_path,
+        {
+            "image_dimensionality": 2,
+            "xy_spacing_nm": 100.0,
+            "preproc_enabled": True,
+            "preproc_method": "gaussian",
+            "preproc_sigma_nm": 100.0,
+            "norm_enabled": True,
+            "norm_method": "robust_z_score",
+            "background_enabled": True,
+            "background_method": "rolling_box_2d",
+            "background_param_nm": 300.0,
+            "maxima_method": "log",
+            "sigma_nm": 150.0,
+            "threshold_value": 0.1,
+            "maxima_min_distance_nm": 200.0,
+            "fit_method": "2D Gaussian",
+            "fit_window": 7,
+            "fit_background_width": 1,
+            "fit_max_iterations": 100,
+            "fit_tolerance": 1e-6,
+            "selected_features": [
+                "fit_snr",
+                "sigma_total_nm",
+                "sigma_product_nm2",
+                "residual_rmse",
+                "core_minus_shell",
+                "component_circularity_2d",
+            ],
+            "fit_cache_enabled": False,
+            "stage1_cache_enabled": False,
+        },
+    )
+
+    assert coords.shape[1] == 2
+    assert len(coords) >= 1
+    assert scores.shape == (len(coords),)
+    assert list(features.columns) == [
+        "fit_snr",
+        "sigma_total_nm",
+        "sigma_product_nm2",
+        "residual_rmse",
+        "core_minus_shell",
+        "component_circularity_2d",
+    ]
+    assert "sigma_z_nm" not in features.columns
 
 
 def test_load_model_requires_native_schema(tmp_path) -> None:

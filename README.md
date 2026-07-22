@@ -1,6 +1,6 @@
 # SNAPpy
 
-SNAPpy detects fluorescent puncta in 3D microscopy z-stacks. It uses a two-stage workflow:
+SNAPpy detects fluorescent puncta in 3D microscopy z-stacks and native 2D microscopy images. It uses a two-stage workflow:
 
 1. Stage 1 finds candidate puncta with LoG or h-max local-maximum detection.
 2. Stage 2 fits each candidate, measures interpretable local features, and uses an SVM to remove false candidates.
@@ -63,9 +63,14 @@ physical spacing values:
 
 ```yaml
 pipeline_defaults:
+  image_dimensionality: 3
   xy_spacing_nm: 128.866  # replace if your xy pixel spacing differs
   z_spacing_nm: 300.0     # replace if your z-step spacing differs
 ```
+
+For native 2D images, set `image_dimensionality: 2`, set `xy_spacing_nm`,
+and use `fit_method: 2D Gaussian`. In 2D mode `z_spacing_nm` is not required
+and z-only Stage 2 features are omitted rather than filled with fake values.
 
 Optimize a model from labeled training and validation images:
 
@@ -112,7 +117,9 @@ labeled_dataset/
     image_101.csv
 ```
 
-Each image must be a 3D TIFF. Each same-stem CSV must contain `x`, `y`, and `z` columns in voxel coordinates.
+Each image must be either a 3D TIFF or, with `pipeline_defaults.image_dimensionality: 2`, a native 2D TIFF. For 3D images, each same-stem CSV must contain `x`, `y`, and `z` columns in voxel coordinates. For 2D images, CSV labels may contain `x,y`, `y,x`, or `axis-0,axis-1` style columns; internally SNAPpy stores 2D coordinates in image-axis order `(y,x)`.
+
+Detection CSVs are dimensionality-aware: 3D output uses `x,y,z,score`, while 2D output uses `x,y,score`.
 
 SNAPpy uses `train/` to fit the Stage 2 SVM. It uses `val/` to choose Stage 1 settings, Stage 2 feature/SVM settings, and the final SVM decision threshold. Held-out test scoring should be done outside SNAPpy by running `mrsnappy detect` and comparing detections to test labels.
 

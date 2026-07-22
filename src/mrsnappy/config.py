@@ -15,6 +15,8 @@ FEATURE_PACKS: dict[str, dict[str, Any]] = deepcopy(FEATURE_PACK_DEFINITIONS)
 
 
 FITTING_MODES: dict[str, dict[str, Any]] = {
+    "gaussian_2d": {"id": "gaussian_2d", "fit_method": "2D Gaussian", "fit_window": 7},
+    "distorted_gaussian_2d": {"id": "distorted_gaussian_2d", "fit_method": "Distorted 2D Gaussian", "fit_window": 7},
     "distorted_gaussian_3d": {"id": "distorted_gaussian_3d", "fit_method": "Distorted 3D Gaussian", "fit_window": 7},
     "gaussian_3d": {"id": "gaussian_3d", "fit_method": "3D Gaussian", "fit_window": 7},
     "xy_z_gaussian": {"id": "xy_z_gaussian", "fit_method": "2D (XY) + 1D (Z) Gaussian", "fit_window": 7},
@@ -84,6 +86,7 @@ DEFAULT_NATIVE_CONFIG: dict[str, Any] = {
     "stage1_recipes": [],
     "stage2_feature_packs": deepcopy(STAGE2_FEATURE_PACK_NAMES),
     "pipeline_defaults": {
+        "image_dimensionality": 3,
         "xy_spacing_nm": None,
         "z_spacing_nm": None,
         "preproc_enabled": True,
@@ -486,10 +489,34 @@ def _validate_profiling_semantics(cfg: dict[str, Any]) -> None:
 
 
 _PUBLIC_FIT_METHODS = {
+    "2D Gaussian",
+    "Distorted 2D Gaussian",
     "2D (XY) + 1D (Z) Gaussian",
     "3D Gaussian",
     "Distorted 3D Gaussian",
 }
+_DEFAULT_2D_FIT_METHOD = "2D Gaussian"
+_DEFAULT_3D_FIT_METHOD = "2D (XY) + 1D (Z) Gaussian"
+_NATIVE_2D_FIT_METHODS = {_DEFAULT_2D_FIT_METHOD, "Distorted 2D Gaussian"}
+_NATIVE_3D_FIT_METHODS = {
+    _DEFAULT_3D_FIT_METHOD,
+    "3D Gaussian",
+    "Distorted 3D Gaussian",
+}
+
+
+def _image_dimensionality(value: Any, path: str = "pipeline_defaults.image_dimensionality") -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{path} must be either 2 or 3.")
+    try:
+        ndim = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{path} must be either 2 or 3.") from exc
+    if ndim not in {2, 3}:
+        raise ValueError(f"{path} must be either 2 or 3.")
+    return ndim
+
+
 def _positive_finite_number(value: Any, path: str) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{path} must be a positive finite number.")
@@ -525,6 +552,7 @@ def _validate_fit_controls(mapping: dict[str, Any], path: str) -> None:
         if fit_method not in _PUBLIC_FIT_METHODS:
             raise ValueError(
                 f"{path}.fit_method must be one of: "
+                "2D Gaussian, Distorted 2D Gaussian, "
                 "2D (XY) + 1D (Z) Gaussian, 3D Gaussian, Distorted 3D Gaussian."
             )
     if "fit_window" in mapping:
@@ -539,12 +567,31 @@ def _validate_fit_controls(mapping: dict[str, Any], path: str) -> None:
         _positive_finite_number(mapping["fit_tolerance"], f"{path}.fit_tolerance")
 
 
+def _validate_fit_method_dimensionality(fit_method: Any, image_dimensionality: int, path: str) -> None:
+    canonical = _canonical_fit_method(fit_method)
+    if canonical not in _PUBLIC_FIT_METHODS:
+        return
+    if image_dimensionality == 2 and canonical not in _NATIVE_2D_FIT_METHODS:
+        raise ValueError(
+            f"{path}={canonical!r} is incompatible with image_dimensionality=2. "
+            "Use '2D Gaussian' or 'Distorted 2D Gaussian'."
+        )
+    if image_dimensionality == 3 and canonical not in _NATIVE_3D_FIT_METHODS:
+        raise ValueError(
+            f"{path}={canonical!r} is incompatible with image_dimensionality=3. "
+            "Use '2D (XY) + 1D (Z) Gaussian', '3D Gaussian', or 'Distorted 3D Gaussian'."
+        )
+
+
 def _validate_pipeline_defaults_semantics(cfg: dict[str, Any]) -> None:
     pipeline_defaults = cfg.get("pipeline_defaults", {})
+    image_dimensionality = _image_dimensionality(pipeline_defaults.get("image_dimensionality", 3))
     if cfg.get("dataset_root") is not None:
-        for key in ("xy_spacing_nm", "z_spacing_nm"):
-            _positive_finite_number(pipeline_defaults.get(key), f"pipeline_defaults.{key}")
+        _positive_finite_number(pipeline_defaults.get("xy_spacing_nm"), "pipeline_defaults.xy_spacing_nm")
+        if image_dimensionality == 3:
+            _positive_finite_number(pipeline_defaults.get("z_spacing_nm"), "pipeline_defaults.z_spacing_nm")
     _validate_fit_controls(pipeline_defaults, "pipeline_defaults")
+    _validate_fit_method_dimensionality(pipeline_defaults.get("fit_method"), image_dimensionality, "pipeline_defaults.fit_method")
 
 
 def _validate_match_distance_semantics(cfg: dict[str, Any]) -> None:
@@ -557,8 +604,10 @@ def _validate_match_distance_semantics(cfg: dict[str, Any]) -> None:
         return
     _positive_finite_number(cfg.get("match_distance_nm"), "match_distance_nm")
     pipeline_defaults = cfg.get("pipeline_defaults", {})
-    for key in ("xy_spacing_nm", "z_spacing_nm"):
-        _positive_finite_number(pipeline_defaults.get(key), f"pipeline_defaults.{key}")
+    image_dimensionality = _image_dimensionality(pipeline_defaults.get("image_dimensionality", 3))
+    _positive_finite_number(pipeline_defaults.get("xy_spacing_nm"), "pipeline_defaults.xy_spacing_nm")
+    if image_dimensionality == 3:
+        _positive_finite_number(pipeline_defaults.get("z_spacing_nm"), "pipeline_defaults.z_spacing_nm")
 
 
 def _preflight_number(value: Any, path: str) -> float:
@@ -594,6 +643,36 @@ def _sync_runtime_cache_config(
         pipeline_defaults[key] = value
 
 
+def _sync_dimensional_pipeline_defaults(cfg: dict[str, Any], payload_pipeline_defaults: dict[str, Any]) -> None:
+    pipeline_defaults = cfg.setdefault("pipeline_defaults", {})
+    image_dimensionality = _image_dimensionality(pipeline_defaults.get("image_dimensionality", 3))
+    pipeline_defaults["image_dimensionality"] = image_dimensionality
+    if "fit_method" in pipeline_defaults:
+        pipeline_defaults["fit_method"] = _map_method_name(pipeline_defaults["fit_method"])
+    payload_fit_method = payload_pipeline_defaults.get("fit_method")
+    should_use_2d_default = (
+        "fit_method" not in payload_pipeline_defaults
+        or _canonical_fit_method(payload_fit_method) == _DEFAULT_3D_FIT_METHOD
+    )
+    if image_dimensionality == 2 and should_use_2d_default:
+        pipeline_defaults["fit_method"] = _DEFAULT_2D_FIT_METHOD
+    if "background_method" in pipeline_defaults:
+        pipeline_defaults["background_method"] = _background_method_for_dimensionality(
+            pipeline_defaults["background_method"],
+            image_dimensionality,
+        )
+    cfg["stage1_background_method"] = _background_method_for_dimensionality(
+        cfg.get("stage1_background_method", "rolling_box_3d"),
+        image_dimensionality,
+    )
+    if "selected_features" not in payload_pipeline_defaults:
+        pipeline_defaults["selected_features"] = resolve_feature_pack_features(
+            "core_fit",
+            pipeline_defaults.get("fit_method"),
+            image_dimensionality=image_dimensionality,
+        )
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
     path = _resolve_config_path(path)
     payload = _validate_config_payload(load_text_config(path))
@@ -610,6 +689,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
         cfg,
         payload_has_runtime_cache=payload_has_runtime_cache,
     )
+    _sync_dimensional_pipeline_defaults(cfg, payload_pipeline_defaults)
     _validate_pipeline_defaults_semantics(cfg)
     _validate_match_distance_semantics(cfg)
     _validate_preflight_semantics(cfg)
@@ -660,6 +740,15 @@ def _map_method_name(value: Any) -> Any:
         "rolling ball 3d exact": "rolling_ball_3d",
         "rolling_ball_3d_exact": "rolling_ball_3d",
         "exact 3d rolling ball": "rolling_ball_3d",
+        "rolling-box-2d": "rolling_box_2d",
+        "rolling box 2d": "rolling_box_2d",
+        "rolling_box_2d": "rolling_box_2d",
+        "morph opening 2d box": "rolling_box_2d",
+        "morph-opening-2d-box": "rolling_box_2d",
+        "morph_opening_2d_box": "rolling_box_2d",
+        "2d box opening": "rolling_box_2d",
+        "box opening 2d": "rolling_box_2d",
+        "scipy 2d box": "rolling_box_2d",
         "rolling-box-3d": "rolling_box_3d",
         "rolling box 3d": "rolling_box_3d",
         "rolling_box_3d": "rolling_box_3d",
@@ -682,6 +771,10 @@ def _map_method_name(value: Any) -> Any:
         "h-maxima": "h_max",
         "h maxima": "h_max",
         "h_maxima": "h_max",
+        "gaussian_2d": "2D Gaussian",
+        "2d gaussian": "2D Gaussian",
+        "distorted_gaussian_2d": "Distorted 2D Gaussian",
+        "distorted 2d gaussian": "Distorted 2D Gaussian",
         "xy_z_gaussian": "2D (XY) + 1D (Z) Gaussian",
         "gaussian_3d": "3D Gaussian",
         "distorted_gaussian_3d": "Distorted 3D Gaussian",
@@ -692,19 +785,32 @@ def _map_method_name(value: Any) -> Any:
     return mapping.get(text, value)
 
 
+def _background_method_for_dimensionality(value: Any, image_dimensionality: int) -> Any:
+    method = _map_method_name(value)
+    if image_dimensionality == 2 and method == "rolling_box_3d":
+        return "rolling_box_2d"
+    return method
+
+
 def _apply_feature_pack(recipe: dict[str, Any], pack_name: str) -> dict[str, Any]:
     if pack_name not in FEATURE_PACKS:
         raise KeyError(f"Unknown feature pack: {pack_name}")
     out = deepcopy(recipe)
     fit_method = out.get("fit_method")
     out["feature_pack_name"] = pack_name
-    out["selected_features"] = resolve_feature_pack_features(pack_name, fit_method)
+    out["selected_features"] = resolve_feature_pack_features(
+        pack_name,
+        fit_method,
+        image_dimensionality=out.get("image_dimensionality", 3),
+    )
     return out
 
 
 def _normalize_recipe(row: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
     recipe = deepcopy(defaults)
     pack_name = row.get("feature_pack_name")
+    row_has_fit_method = "fit_method" in row
+    row_has_selected_features = "selected_features" in row
     if pack_name:
         recipe = _apply_feature_pack(recipe, str(pack_name))
     for key, value in row.items():
@@ -714,7 +820,29 @@ def _normalize_recipe(row: dict[str, Any], defaults: dict[str, Any]) -> dict[str
     for method_key in ("preproc_method", "norm_method", "background_method", "maxima_method", "fit_method"):
         if method_key in recipe:
             recipe[method_key] = _map_method_name(recipe[method_key])
+    recipe["image_dimensionality"] = _image_dimensionality(recipe.get("image_dimensionality", 3), "recipe.image_dimensionality")
+    if "background_method" in recipe:
+        recipe["background_method"] = _background_method_for_dimensionality(recipe["background_method"], recipe["image_dimensionality"])
+    if not row_has_fit_method:
+        inherited_fit_method = _canonical_fit_method(recipe.get("fit_method"))
+        if recipe["image_dimensionality"] == 2 and inherited_fit_method == _DEFAULT_3D_FIT_METHOD:
+            recipe["fit_method"] = _DEFAULT_2D_FIT_METHOD
+        elif recipe["image_dimensionality"] == 3 and inherited_fit_method == _DEFAULT_2D_FIT_METHOD:
+            recipe["fit_method"] = _DEFAULT_3D_FIT_METHOD
+        if not pack_name and not row_has_selected_features:
+            recipe["selected_features"] = resolve_feature_pack_features(
+                "core_fit",
+                recipe.get("fit_method"),
+                image_dimensionality=recipe.get("image_dimensionality"),
+            )
+    if pack_name:
+        recipe["selected_features"] = resolve_feature_pack_features(
+            str(pack_name),
+            recipe.get("fit_method"),
+            image_dimensionality=recipe.get("image_dimensionality"),
+        )
     _validate_fit_controls(recipe, "recipe")
+    _validate_fit_method_dimensionality(recipe.get("fit_method"), recipe["image_dimensionality"], "recipe.fit_method")
     return recipe
 
 
@@ -775,7 +903,11 @@ def _expand_stage1_processing_rows(base_row: dict[str, Any], cfg: dict[str, Any]
         if smoothing_rows:
             rows = smoothing_rows
 
-    background_method = _map_method_name(cfg.get("stage1_background_method", "rolling_box_3d"))
+    image_dimensionality = _image_dimensionality(
+        cfg.get("pipeline_defaults", {}).get("image_dimensionality", 3),
+        "pipeline_defaults.image_dimensionality",
+    )
+    background_method = _background_method_for_dimensionality(cfg.get("stage1_background_method", "rolling_box_3d"), image_dimensionality)
     has_explicit_background = any(
         key in base_row for key in ("background_enabled", "background_method", "background_param", "background_param_nm")
     )
@@ -854,6 +986,7 @@ def _stage1_recipe_id(recipe: dict[str, Any]) -> str:
         bg_prefix = {
             "slice_opening_2d": "slice2d",
             "rolling_ball_2d": "rb2d",
+            "rolling_box_2d": "rbox2d",
             "rolling_ball_3d": "rb3d",
             "rolling_box_3d": "rbox3d",
         }.get(bg_method, bg_method)
@@ -909,6 +1042,7 @@ def _stage1_dedup_key(recipe: dict[str, Any]) -> str:
         method = "h_max"
 
     payload: dict[str, Any] = {
+        "image_dimensionality": recipe.get("image_dimensionality", 3),
         "xy_spacing_nm": recipe.get("xy_spacing_nm"),
         "z_spacing_nm": recipe.get("z_spacing_nm"),
         "norm_enabled": bool(recipe.get("norm_enabled", True)),

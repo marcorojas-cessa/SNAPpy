@@ -39,6 +39,13 @@ MORPHOLOGY_FEATURE_NAMES = frozenset(
         "component_convex_voxel_volume",
         "component_solidity_3d",
         "component_elongation_3d",
+        "component_pixel_area",
+        "component_boundary_px",
+        "component_boundary_to_area_ratio",
+        "component_circularity_2d",
+        "component_convex_size_px",
+        "component_solidity_2d",
+        "component_elongation_2d",
         "component_centroid_fit_distance_nm",
     }
 )
@@ -350,7 +357,7 @@ def _axis_region_diff(data: np.ndarray, axis: int, center_index: np.ndarray) -> 
 
 
 def _contrast_features(data: np.ndarray, center_index: np.ndarray) -> dict[str, float]:
-    if data.ndim != 3 or data.size == 0:
+    if data.ndim not in {2, 3} or data.size == 0:
         return {name: 0.0 for name in (
             "core_mean",
             "core_std",
@@ -362,6 +369,31 @@ def _contrast_features(data: np.ndarray, center_index: np.ndarray) -> dict[str, 
             "z_core_minus_shell",
             "halfspace_absdiff_max",
         )}
+
+    if data.ndim == 2:
+        core_slices = tuple(slice(max(int(c) - 1, 0), min(int(c) + 2, data.shape[axis])) for axis, c in enumerate(center_index))
+        core_mask = np.zeros(data.shape, dtype=bool)
+        core_mask[core_slices] = True
+        core = data[core_mask]
+        shell = data[~core_mask]
+        core_mean = _safe_mean(core)
+        shell_mean = _safe_mean(shell)
+        shell_std = _safe_std(shell)
+        halfspace_diffs = [
+            _axis_region_diff(data, 1, center_index),
+            _axis_region_diff(data, 0, center_index),
+        ]
+        core_minus_shell = float(core_mean - shell_mean)
+        return {
+            "core_mean": core_mean,
+            "core_std": _safe_std(core),
+            "shell_mean": shell_mean,
+            "shell_std": shell_std,
+            "core_minus_shell": core_minus_shell,
+            "core_shell_snr": float(core_minus_shell / max(shell_std, 1e-6)),
+            "xy_core_minus_shell": core_minus_shell,
+            "halfspace_absdiff_max": float(max(halfspace_diffs)) if halfspace_diffs else 0.0,
+        }
 
     core_slices = tuple(slice(max(int(c) - 1, 0), min(int(c) + 2, data.shape[axis])) for axis, c in enumerate(center_index))
     core_mask = np.zeros(data.shape, dtype=bool)
@@ -437,6 +469,12 @@ def _component_sphericity(volume: float, surface_area: float) -> float:
     return float((np.pi ** (1.0 / 3.0)) * ((6.0 * volume) ** (2.0 / 3.0)) / max(surface_area, 1e-6))
 
 
+def _component_circularity(area: float, perimeter: float) -> float:
+    if area <= 0 or perimeter <= 0:
+        return 0.0
+    return float((4.0 * np.pi * area) / max(perimeter**2, 1e-6))
+
+
 def _component_elongation(points: np.ndarray) -> float:
     if len(points) < 2:
         return 0.0
@@ -454,15 +492,19 @@ def _component_elongation(points: np.ndarray) -> float:
     return float(1.0 - axis_min / axis_max)
 
 
-def _morphology_features(
-    data: np.ndarray,
-    center_index: np.ndarray,
-    fitted_center_zero_based: np.ndarray,
-    fit_amplitude: float,
-    xy_spacing_nm: float,
-    z_spacing_nm: float,
-) -> dict[str, float]:
-    names = (
+def _morphology_feature_names(ndim: int) -> tuple[str, ...]:
+    if ndim == 2:
+        return (
+            "component_pixel_area",
+            "component_boundary_px",
+            "component_boundary_to_area_ratio",
+            "component_circularity_2d",
+            "component_convex_size_px",
+            "component_solidity_2d",
+            "component_elongation_2d",
+            "component_centroid_fit_distance_nm",
+        )
+    return (
         "component_voxel_volume",
         "component_surface_area_vox2",
         "component_surface_to_volume_ratio",
@@ -472,15 +514,26 @@ def _morphology_features(
         "component_elongation_3d",
         "component_centroid_fit_distance_nm",
     )
-    if data.ndim != 3 or data.size == 0 or fit_amplitude <= 0:
+
+
+def _morphology_features(
+    data: np.ndarray,
+    center_index: np.ndarray,
+    fitted_center_zero_based: np.ndarray,
+    fit_amplitude: float,
+    xy_spacing_nm: float,
+    z_spacing_nm: float,
+) -> dict[str, float]:
+    names = _morphology_feature_names(data.ndim)
+    if data.ndim not in {2, 3} or data.size == 0 or fit_amplitude <= 0:
         return {name: 0.0 for name in names}
 
     threshold = 0.5 * float(fit_amplitude)
     mask = np.asarray(data >= threshold, dtype=bool)
     if not np.any(mask):
         return {name: 0.0 for name in names}
-    fill_structure = ndi.generate_binary_structure(3, 1)
-    label_structure = ndi.generate_binary_structure(3, 3)
+    fill_structure = ndi.generate_binary_structure(data.ndim, 1)
+    label_structure = ndi.generate_binary_structure(data.ndim, data.ndim)
     filled = ndi.binary_fill_holes(mask, structure=fill_structure)
     labels, n_labels = ndi.label(filled, structure=label_structure)
     if n_labels == 0:
@@ -497,7 +550,7 @@ def _morphology_features(
         distance = float(np.linalg.norm(centroid - center))
         volume = float(len(points))
         surface = _surface_area_vox2(component)
-        sphericity = _component_sphericity(volume, surface)
+        sphericity = _component_circularity(volume, surface) if data.ndim == 2 else _component_sphericity(volume, surface)
         components.append((distance, -volume, -sphericity, label_id, component, centroid))
     if not components:
         return {name: 0.0 for name in names}
@@ -507,18 +560,39 @@ def _morphology_features(
     convex_volume = _convex_voxel_volume(component)
     points = np.column_stack(np.nonzero(component)).astype(np.float64)
     centroid_delta = centroid - np.asarray(fitted_center_zero_based, dtype=np.float64)
-    centroid_distance_nm = float(
-        np.sqrt(
-            (centroid_delta[2] * xy_spacing_nm) ** 2
-            + (centroid_delta[1] * xy_spacing_nm) ** 2
-            + (centroid_delta[0] * z_spacing_nm) ** 2
+    if data.ndim == 2:
+        centroid_distance_nm = float(
+            np.sqrt(
+                (centroid_delta[1] * xy_spacing_nm) ** 2
+                + (centroid_delta[0] * xy_spacing_nm) ** 2
+            )
         )
-    )
+        sphericity_value = _component_circularity(volume, surface)
+    else:
+        centroid_distance_nm = float(
+            np.sqrt(
+                (centroid_delta[2] * xy_spacing_nm) ** 2
+                + (centroid_delta[1] * xy_spacing_nm) ** 2
+                + (centroid_delta[0] * z_spacing_nm) ** 2
+            )
+        )
+        sphericity_value = _component_sphericity(volume, surface)
+    if data.ndim == 2:
+        return {
+            "component_pixel_area": volume,
+            "component_boundary_px": surface,
+            "component_boundary_to_area_ratio": float(surface / max(volume, 1e-6)),
+            "component_circularity_2d": sphericity_value,
+            "component_convex_size_px": convex_volume,
+            "component_solidity_2d": float(volume / max(convex_volume, 1e-6)),
+            "component_elongation_2d": _component_elongation(points),
+            "component_centroid_fit_distance_nm": centroid_distance_nm,
+        }
     return {
         "component_voxel_volume": volume,
         "component_surface_area_vox2": surface,
         "component_surface_to_volume_ratio": float(surface / max(volume, 1e-6)),
-        "component_sphericity_3d": _component_sphericity(volume, surface),
+        "component_sphericity_3d": sphericity_value,
         "component_convex_voxel_volume": convex_volume,
         "component_solidity_3d": float(volume / max(convex_volume, 1e-6)),
         "component_elongation_3d": _component_elongation(points),
@@ -526,9 +600,51 @@ def _morphology_features(
     }
 
 
-def _fit_patch(signal: np.ndarray, center_guess: np.ndarray, cfg: dict[str, float | int | str]) -> dict[str, float]:
+def _fit_moments_patch(signal: np.ndarray, center_guess: np.ndarray) -> dict[str, Any]:
+    positive_signal = np.clip(signal, 0.0, None)
+    total = float(np.sum(positive_signal))
+    grid = np.indices(signal.shape, dtype=np.float32)
+    if total <= 0:
+        center = np.asarray(center_guess, dtype=np.float32)
+        sigma = np.ones(signal.ndim, dtype=np.float32)
+        cov = np.eye(signal.ndim, dtype=np.float32)
+    else:
+        center_zero_based = np.array([(grid[a] * positive_signal).sum() / total for a in range(signal.ndim)], dtype=np.float32)
+        centered = grid.reshape(signal.ndim, -1).T - center_zero_based
+        weights = positive_signal.reshape(-1)
+        cov = (centered.T * weights) @ centered / (float(weights.sum()) + 1e-8)
+        cov = np.asarray(cov, dtype=np.float32)
+        sigma = np.sqrt(np.clip(np.diag(cov), 1e-3, None))
+        center = center_zero_based + 1.0
+    diag = np.clip(np.diag(cov), 1e-6, None)
+    return {
+        "fit_method_id": "moments",
+        "center": center,
+        "amplitude": float(np.max(signal)),
+        "amplitude_x": float(np.max(signal)),
+        "amplitude_y": float(np.max(signal)),
+        "amplitude_z": float(np.max(signal)) if signal.ndim == 3 else float("nan"),
+        "amplitude_xy": float(np.max(signal)),
+        "sigma": sigma if len(sigma) == 3 else np.array([np.nan, sigma[0], sigma[1]], dtype=np.float32),
+        "rho": np.array(
+            [
+                float(cov[1, 2] / np.sqrt(diag[1] * diag[2])) if signal.ndim == 3 else 0.0,
+                float(cov[0, 2] / np.sqrt(diag[0] * diag[2])) if signal.ndim == 3 else 0.0,
+                float(cov[0, 1] / np.sqrt(diag[0] * diag[1])) if signal.ndim == 3 else 0.0,
+            ],
+            dtype=np.float32,
+        ),
+        "r_squared": float(np.max(signal) / max(float(np.max(signal) + np.mean(signal)), 1e-6)),
+    }
+
+
+def _fit_patch(signal: np.ndarray, center_guess: np.ndarray, cfg: dict[str, float | int | str]) -> dict[str, Any]:
     method_key = str(cfg.get("fit_method", "moments")).strip().lower()
     valid_methods = {
+        "2d gaussian",
+        "gaussian_2d",
+        "distorted 2d gaussian",
+        "distorted_gaussian_2d",
         "2d (xy) + 1d (z) gaussian",
         "3d gaussian",
         "distorted 3d gaussian",
@@ -539,14 +655,48 @@ def _fit_patch(signal: np.ndarray, center_guess: np.ndarray, cfg: dict[str, floa
     if method_key not in valid_methods:
         raise ValueError(
             "Unsupported fit_method. Expected one of: "
+            "2D Gaussian, Distorted 2D Gaussian, "
             "2D (XY) + 1D (Z) Gaussian, 3D Gaussian, Distorted 3D Gaussian, moments."
         )
     max_iterations = _positive_integer(cfg.get("fit_max_iterations", 200), "fit_max_iterations")
     tolerance = _positive_finite_float(cfg.get("fit_tolerance", 1e-6), "fit_tolerance")
     if signal.ndim == 2:
+        if method_key in {"moments", "moment", "image moments"}:
+            return _fit_moments_patch(signal, center_guess)
+        if method_key in {"2d gaussian", "gaussian_2d"}:
+            fit2d, r2 = _fit_2d_axis_aligned(signal, (float(center_guess[0]), float(center_guess[1])), max_iterations, tolerance)
+            coords = _coords_for_shape(signal.shape)
+            model_patch = _gaussian_2d_axis_aligned(fit2d, coords).reshape(signal.shape)
+            residual = signal.astype(np.float64, copy=False) - model_patch
+            residual_energy = float(np.sum(residual**2))
+            signal_energy = float(np.sum(signal.astype(np.float64, copy=False) ** 2))
+            return {
+                "fit_method_id": "gaussian_2d",
+                "center": np.array([fit2d[1], fit2d[2]], dtype=np.float32),
+                "amplitude": float(fit2d[0]),
+                "amplitude_x": float(fit2d[0]),
+                "amplitude_y": float(fit2d[0]),
+                "amplitude_z": float("nan"),
+                "amplitude_xy": float(fit2d[0]),
+                "sigma": np.array([float("nan"), fit2d[3], fit2d[4]], dtype=np.float32),
+                "rho": np.array([0.0, 0.0, 0.0], dtype=np.float32),
+                "r_squared": float(r2),
+                "residual_rmse": float(np.sqrt(np.mean(residual**2))),
+                "residual_energy_norm": float(residual_energy / max(signal_energy, 1e-6)),
+            }
+        if method_key not in {"distorted 2d gaussian", "distorted_gaussian_2d"}:
+            raise ValueError(
+                f"fit_method {cfg.get('fit_method')!r} is incompatible with native 2D images. "
+                "Use '2D Gaussian', 'Distorted 2D Gaussian', or 'moments'."
+            )
         fit2d, r2 = _fit_2d_distorted(signal, (float(center_guess[0]), float(center_guess[1])), max_iterations, tolerance)
+        coords = _coords_for_shape(signal.shape)
+        model_patch = _gaussian_2d_distorted(fit2d, coords).reshape(signal.shape)
+        residual = signal.astype(np.float64, copy=False) - model_patch
+        residual_energy = float(np.sum(residual**2))
+        signal_energy = float(np.sum(signal.astype(np.float64, copy=False) ** 2))
         return {
-            "fit_method_id": "gaussian_2d",
+            "fit_method_id": "distorted_gaussian_2d",
             "center": np.array([fit2d[1], fit2d[2]], dtype=np.float32),
             "amplitude": float(fit2d[0]),
             "amplitude_x": float(fit2d[0]),
@@ -556,7 +706,14 @@ def _fit_patch(signal: np.ndarray, center_guess: np.ndarray, cfg: dict[str, floa
             "sigma": np.array([float("nan"), fit2d[3], fit2d[4]], dtype=np.float32),
             "rho": np.array([fit2d[5], 0.0, 0.0], dtype=np.float32),
             "r_squared": float(r2),
+            "residual_rmse": float(np.sqrt(np.mean(residual**2))),
+            "residual_energy_norm": float(residual_energy / max(signal_energy, 1e-6)),
         }
+    if method_key in {"2d gaussian", "gaussian_2d", "distorted 2d gaussian", "distorted_gaussian_2d"}:
+        raise ValueError(
+            f"fit_method {cfg.get('fit_method')!r} is incompatible with native 3D images. "
+            "Use '2D (XY) + 1D (Z) Gaussian', '3D Gaussian', 'Distorted 3D Gaussian', or 'moments'."
+        )
     if "distorted 3d" in method_key:
         fit3d, r2 = _fit_3d_distorted(signal, (float(center_guess[0]), float(center_guess[1]), float(center_guess[2])), max_iterations, tolerance)
         coords = _coords_for_shape(signal.shape)
@@ -621,41 +778,7 @@ def _fit_patch(signal: np.ndarray, center_guess: np.ndarray, cfg: dict[str, floa
             "rho": np.array([0.0, 0.0, 0.0], dtype=np.float32),
             "r_squared": float((r2_xy + r2_z) / 2.0),
         }
-    positive_signal = np.clip(signal, 0.0, None)
-    total = float(np.sum(positive_signal))
-    grid = np.indices(signal.shape, dtype=np.float32)
-    if total <= 0:
-        center = np.asarray(center_guess, dtype=np.float32)
-        sigma = np.ones(signal.ndim, dtype=np.float32)
-        cov = np.eye(signal.ndim, dtype=np.float32)
-    else:
-        center_zero_based = np.array([(grid[a] * positive_signal).sum() / total for a in range(signal.ndim)], dtype=np.float32)
-        centered = grid.reshape(signal.ndim, -1).T - center_zero_based
-        weights = positive_signal.reshape(-1)
-        cov = (centered.T * weights) @ centered / (float(weights.sum()) + 1e-8)
-        cov = np.asarray(cov, dtype=np.float32)
-        sigma = np.sqrt(np.clip(np.diag(cov), 1e-3, None))
-        center = center_zero_based + 1.0
-    diag = np.clip(np.diag(cov), 1e-6, None)
-    return {
-        "fit_method_id": "moments",
-        "center": center,
-        "amplitude": float(np.max(signal)),
-        "amplitude_x": float(np.max(signal)),
-        "amplitude_y": float(np.max(signal)),
-        "amplitude_z": float(np.max(signal)),
-        "amplitude_xy": float(np.max(signal)),
-        "sigma": sigma if len(sigma) == 3 else np.array([np.nan, sigma[0], sigma[1]], dtype=np.float32),
-        "rho": np.array(
-            [
-                float(cov[1, 2] / np.sqrt(diag[1] * diag[2])) if signal.ndim == 3 else 0.0,
-                float(cov[0, 2] / np.sqrt(diag[0] * diag[2])) if signal.ndim == 3 else 0.0,
-                float(cov[0, 1] / np.sqrt(diag[0] * diag[1])) if signal.ndim == 3 else 0.0,
-            ],
-            dtype=np.float32,
-        ),
-        "r_squared": float(np.max(signal) / max(float(np.max(signal) + np.mean(signal)), 1e-6)),
-    }
+    return _fit_moments_patch(signal, center_guess)
 
 
 def refine_candidates(
@@ -677,7 +800,7 @@ def refine_candidates(
     needs_contrast = _needs_feature_group(requested_features, CONTRAST_FEATURE_NAMES)
     needs_morphology = _needs_feature_group(requested_features, MORPHOLOGY_FEATURE_NAMES)
     xy_spacing_nm = _positive_finite_float(cfg.get("xy_spacing_nm"), "xy_spacing_nm") if needs_morphology else 1.0
-    z_spacing_nm = _positive_finite_float(cfg.get("z_spacing_nm"), "z_spacing_nm") if needs_morphology else 1.0
+    z_spacing_nm = _positive_finite_float(cfg.get("z_spacing_nm"), "z_spacing_nm") if needs_morphology and volume.ndim == 3 else 1.0
 
     refined = np.zeros_like(coords, dtype=np.float32)
     rows: list[dict[str, float | str]] = []
@@ -721,10 +844,19 @@ def refine_candidates(
                 )
             )
         refined[idx] = local_center
+        if window_data.ndim == 2:
+            coordinate_row = {
+                "y": float(local_center[0]),
+                "x": float(local_center[1]),
+            }
+        else:
+            coordinate_row = {
+                "z": float(local_center[0]),
+                "y": float(local_center[1]),
+                "x": float(local_center[2]),
+            }
         row = {
-            "z": float(local_center[0]) if window_data.ndim >= 1 else 0.0,
-            "y": float(local_center[1]) if window_data.ndim >= 2 else 0.0,
-            "x": float(local_center[2]) if window_data.ndim >= 3 else 0.0,
+            **coordinate_row,
             "score_raw": float(scores[idx]),
             "fit_method_id": str(fitted.get("fit_method_id", "")),
             "fit_amplitude": fit_amplitude,

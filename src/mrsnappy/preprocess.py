@@ -26,6 +26,11 @@ def _background_method_name(value: object) -> str:
         "rollingball_2d": "rolling_ball_2d",
         "slice_rolling_ball": "rolling_ball_2d",
         "slice_wise_rolling_ball": "rolling_ball_2d",
+        "rolling_box_2d": "rolling_box_2d",
+        "morph_opening_2d_box": "rolling_box_2d",
+        "2d_box_opening": "rolling_box_2d",
+        "box_opening_2d": "rolling_box_2d",
+        "scipy_2d_box": "rolling_box_2d",
         "rolling_ball_3d": "rolling_ball_3d",
         "rolling_ball_3d_exact": "rolling_ball_3d",
         "exact_3d_rolling_ball": "rolling_ball_3d",
@@ -75,7 +80,7 @@ def _apply_preprocessing_filter(volume: np.ndarray, cfg: dict) -> np.ndarray:
     if method in {"none", ""}:
         return out
     if method != "gaussian":
-        raise ValueError("SNAPpy Stage 1 smoothing supports only 'none' or 3D Gaussian smoothing.")
+        raise ValueError("SNAPpy Stage 1 smoothing supports only 'none' or Gaussian smoothing.")
     if _has_value(cfg, "preproc_sigma_nm"):
         sigma = sigma_nm_to_voxels(cfg["preproc_sigma_nm"], cfg, out.ndim, "preproc_sigma_nm")
     else:
@@ -107,10 +112,10 @@ def _apply_background_correction(volume: np.ndarray, cfg: dict) -> np.ndarray:
     method = _background_method_name(cfg.get("background_method", "none"))
     if method in {"none", ""}:
         return volume
-    if method not in {"slice_opening_2d", "rolling_ball_2d", "rolling_ball_3d", "rolling_box_3d"}:
+    if method not in {"slice_opening_2d", "rolling_ball_2d", "rolling_box_2d", "rolling_ball_3d", "rolling_box_3d"}:
         raise ValueError(
             "SNAPpy Stage 1 background correction supports 'none', 'slice_opening_2d', "
-            "'rolling_ball_2d', 'rolling_ball_3d', or 'rolling_box_3d'."
+            "'rolling_ball_2d', 'rolling_box_2d', 'rolling_ball_3d', or 'rolling_box_3d'."
         )
     out = np.asarray(volume, dtype=np.float32, copy=False)
     physical_radius = _has_value(cfg, "background_param_nm")
@@ -135,6 +140,14 @@ def _apply_background_correction(volume: np.ndarray, cfg: dict) -> np.ndarray:
                 background[z_index] = _rolling_ball_background(out[z_index], radius_xy)
         else:
             background = _rolling_ball_background(out, radius_xy)
+    elif method == "rolling_box_2d":
+        size_xy = tuple(int(radius) * 2 + 1 for radius in radius_by_axis[-2:])
+        if out.ndim == 3:
+            background = np.empty_like(out, dtype=np.float32)
+            for z_index in range(out.shape[0]):
+                background[z_index] = ndi.grey_opening(out[z_index], size=size_xy)
+        else:
+            background = ndi.grey_opening(out, size=size_xy)
     elif method == "rolling_box_3d":
         size_by_axis = tuple(int(radius) * 2 + 1 for radius in radius_by_axis)
         if out.ndim == 3:

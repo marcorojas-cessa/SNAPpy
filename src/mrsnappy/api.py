@@ -7,6 +7,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import yaml
 
@@ -133,15 +134,18 @@ def _iter_images(input_path: str | Path | None, input_list: str | Path | None) -
 
 def _write_detections_csv(path: Path, coords: Any, scores: Any) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
-        {
-            "detection_id": list(range(1, len(coords) + 1)),
-            "x": coords[:, 2] if len(coords) else [],
-            "y": coords[:, 1] if len(coords) else [],
-            "z": coords[:, 0] if len(coords) else [],
-            "score": scores if len(scores) else [],
-        }
-    ).to_csv(path, index=False)
+    coords = np.asarray(coords, dtype=np.float32)
+    if coords.ndim != 2 or coords.shape[1] not in {2, 3}:
+        raise ValueError("SNAPpy detections must have shape (n, 2) or (n, 3).")
+    data: dict[str, Any] = {
+        "detection_id": list(range(1, len(coords) + 1)),
+        "x": coords[:, -1] if len(coords) else [],
+        "y": coords[:, -2] if len(coords) else [],
+    }
+    if coords.shape[1] == 3:
+        data["z"] = coords[:, 0] if len(coords) else []
+    data["score"] = scores if len(scores) else []
+    pd.DataFrame(data).to_csv(path, index=False)
     return path
 
 

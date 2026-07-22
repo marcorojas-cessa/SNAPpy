@@ -256,6 +256,34 @@ def test_stage1_background_method_can_be_configured(tmp_path) -> None:
     assert {recipe["background_method"] for recipe in recipes if recipe["background_enabled"]} == {"rolling_ball_2d"}
 
 
+def test_2d_stage1_default_box_background_uses_rolling_box_2d(tmp_path) -> None:
+    config_path = tmp_path / "background_method_2d_default.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "pipeline_defaults": {
+                    "image_dimensionality": 2,
+                    "xy_spacing_nm": 100.0,
+                }
+            }
+        )
+    )
+    cfg = load_config(config_path)
+    recipes = recipe_bank(cfg)
+
+    assert cfg["stage1_background_method"] == "rolling_box_2d"
+    assert {recipe["background_method"] for recipe in recipes if recipe["background_enabled"]} == {"rolling_box_2d"}
+
+
+def test_stage1_rolling_box_2d_background_method_can_be_configured(tmp_path) -> None:
+    config_path = tmp_path / "background_method_rolling_box_2d.json"
+    config_path.write_text(json.dumps({"stage1_background_method": "rolling_box_2d"}))
+    cfg = load_config(config_path)
+    recipes = recipe_bank(cfg)
+
+    assert {recipe["background_method"] for recipe in recipes if recipe["background_enabled"]} == {"rolling_box_2d"}
+
+
 def test_physical_stage1_fields_do_not_inherit_unspecified_voxel_sweeps(tmp_path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text(
@@ -517,6 +545,152 @@ def test_match_distance_nm_requires_physical_spacing(tmp_path) -> None:
         load_config(config_path)
 
 
+def test_2d_config_uses_xy_spacing_without_z_spacing(tmp_path) -> None:
+    config_path = tmp_path / "match_distance_2d.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "match_distance_nm": 200.0,
+                "pipeline_defaults": {
+                    "image_dimensionality": 2,
+                    "xy_spacing_nm": 100.0,
+                },
+            }
+        )
+    )
+
+    cfg = load_config(config_path)
+    recipes = stage2_recipe_bank(cfg, recipe_bank(cfg)[:1])
+    selected = recipes[0]["selected_features"]
+
+    assert cfg["pipeline_defaults"]["image_dimensionality"] == 2
+    assert cfg["pipeline_defaults"]["fit_method"] == "2D Gaussian"
+    assert cfg["stage1_background_method"] == "rolling_box_2d"
+    assert "sigma_total_nm" in selected
+    assert "sigma_product_nm2" in selected
+    assert "sigma_product_nm3" not in selected
+    assert "sigma_z_nm" not in selected
+    assert "sigma_axial_ratio" not in selected
+
+
+def test_2d_config_generated_default_fit_method_is_auto_corrected(tmp_path) -> None:
+    config_path = tmp_path / "generated_default_2d.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "match_distance_nm": 200.0,
+                "pipeline_defaults": {
+                    "image_dimensionality": 2,
+                    "xy_spacing_nm": 100.0,
+                    "fit_method": "2D (XY) + 1D (Z) Gaussian",
+                },
+            }
+        )
+    )
+
+    cfg = load_config(config_path)
+
+    assert cfg["pipeline_defaults"]["fit_method"] == "2D Gaussian"
+
+
+def test_2d_config_rejects_explicit_3d_fit_method(tmp_path) -> None:
+    config_path = tmp_path / "bad_2d_fit_method.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "match_distance_nm": 200.0,
+                "pipeline_defaults": {
+                    "image_dimensionality": 2,
+                    "xy_spacing_nm": 100.0,
+                    "fit_method": "3D Gaussian",
+                },
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="incompatible with image_dimensionality=2"):
+        load_config(config_path)
+
+
+def test_2d_config_accepts_distorted_2d_fit_method(tmp_path) -> None:
+    config_path = tmp_path / "distorted_2d_fit_method.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "match_distance_nm": 200.0,
+                "pipeline_defaults": {
+                    "image_dimensionality": 2,
+                    "xy_spacing_nm": 100.0,
+                    "fit_method": "Distorted 2D Gaussian",
+                },
+            }
+        )
+    )
+
+    cfg = load_config(config_path)
+    recipes = stage2_recipe_bank(cfg, recipe_bank(cfg)[:1])
+    morphology_recipe = next(recipe for recipe in recipes if recipe["feature_pack_name"] == "core_morphology")
+
+    assert cfg["pipeline_defaults"]["fit_method"] == "Distorted 2D Gaussian"
+    assert "rho_lateral_abs" in morphology_recipe["selected_features"]
+    assert "covariance_elongation" in morphology_recipe["selected_features"]
+    assert "rho_axial_energy" not in morphology_recipe["selected_features"]
+    assert "sigma_z_nm" not in morphology_recipe["selected_features"]
+
+
+def test_2d_stage1_recipe_without_fit_method_inherits_2d_fit(tmp_path) -> None:
+    config_path = tmp_path / "recipe_2d_default_fit.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "match_distance_nm": 200.0,
+                "pipeline_defaults": {
+                    "image_dimensionality": 3,
+                    "xy_spacing_nm": 100.0,
+                    "z_spacing_nm": 300.0,
+                },
+                "stage1_recipes": [
+                    {
+                        "recipe_id": "native_2d_recipe",
+                        "image_dimensionality": 2,
+                        "xy_spacing_nm": 100.0,
+                        "maxima_method": "log",
+                    }
+                ],
+            }
+        )
+    )
+
+    cfg = load_config(config_path)
+    recipes = recipe_bank(cfg)
+
+    assert recipes[0]["image_dimensionality"] == 2
+    assert recipes[0]["fit_method"] == "2D Gaussian"
+    assert "sigma_z_nm" not in recipes[0]["selected_features"]
+
+
+def test_2d_stage1_recipe_rejects_explicit_3d_fit_method(tmp_path) -> None:
+    config_path = tmp_path / "bad_recipe_2d_fit_method.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "stage1_recipes": [
+                    {
+                        "recipe_id": "bad_native_2d_recipe",
+                        "image_dimensionality": 2,
+                        "fit_method": "Distorted 3D Gaussian",
+                        "maxima_method": "log",
+                    }
+                ],
+            }
+        )
+    )
+    cfg = load_config(config_path)
+
+    with pytest.raises(ValueError, match="incompatible with image_dimensionality=2"):
+        recipe_bank(cfg)
+
+
 def test_current_fit_method_ids_are_accepted(tmp_path) -> None:
     config_path = tmp_path / "fit_method_id.json"
     config_path.write_text(json.dumps({"pipeline_defaults": {"fit_method": "distorted_gaussian_3d"}}))
@@ -525,6 +699,26 @@ def test_current_fit_method_ids_are_accepted(tmp_path) -> None:
     recipes = recipe_bank(cfg)
 
     assert {recipe["fit_method"] for recipe in recipes} == {"Distorted 3D Gaussian"}
+
+
+def test_current_distorted_2d_fit_method_id_is_accepted(tmp_path) -> None:
+    config_path = tmp_path / "distorted_2d_fit_method_id.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "match_distance_nm": 200.0,
+                "pipeline_defaults": {
+                    "image_dimensionality": 2,
+                    "xy_spacing_nm": 100.0,
+                    "fit_method": "distorted_gaussian_2d",
+                },
+            }
+        )
+    )
+
+    cfg = load_config(config_path)
+
+    assert cfg["pipeline_defaults"]["fit_method"] == "Distorted 2D Gaussian"
 
 
 def test_negative_to_positive_ratio_is_not_a_user_parameter(tmp_path) -> None:
@@ -584,6 +778,42 @@ def test_stage2_sweeps_all_explicit_feature_packs() -> None:
     assert all("score_raw" not in pack["features"] for pack in FEATURE_PACKS.values())
 
 
+def test_stage2_feature_packs_resolve_modern_2d_feature_names(tmp_path) -> None:
+    config_path = tmp_path / "feature_pack_2d_names.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "match_distance_nm": 200.0,
+                "pipeline_defaults": {
+                    "image_dimensionality": 2,
+                    "xy_spacing_nm": 100.0,
+                    "fit_method": "Distorted 2D Gaussian",
+                },
+            }
+        )
+    )
+    cfg = load_config(config_path)
+    recipes = stage2_recipe_bank(cfg, recipe_bank(cfg)[:1])
+    full = next(recipe for recipe in recipes if recipe["feature_pack_name"] == "full_interpretable")
+    selected = set(full["selected_features"])
+
+    assert {
+        "sigma_product_nm2",
+        "component_pixel_area",
+        "component_boundary_px",
+        "component_boundary_to_area_ratio",
+        "component_circularity_2d",
+        "component_convex_size_px",
+        "component_solidity_2d",
+        "component_elongation_2d",
+    } <= selected
+    assert "xy_core_minus_shell" in selected
+    assert "z_core_minus_shell" not in selected
+    assert "sigma_product_nm3" not in selected
+    assert "component_sphericity_3d" not in selected
+    assert "rho_lateral_abs" in selected
+
+
 def test_cross_validation_mode_is_reserved_until_implemented(tmp_path) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text("optimization_mode: cross_validation\n")
@@ -592,6 +822,8 @@ def test_cross_validation_mode_is_reserved_until_implemented(tmp_path) -> None:
 
 
 def test_known_fitting_modes_are_named_for_documentation() -> None:
+    assert FITTING_MODES["gaussian_2d"]["fit_method"] == "2D Gaussian"
+    assert FITTING_MODES["distorted_gaussian_2d"]["fit_method"] == "Distorted 2D Gaussian"
     assert FITTING_MODES["distorted_gaussian_3d"]["fit_method"] == "Distorted 3D Gaussian"
     assert FITTING_MODES["gaussian_3d"]["fit_method"] == "3D Gaussian"
     assert FITTING_MODES["xy_z_gaussian"]["fit_method"] == "2D (XY) + 1D (Z) Gaussian"

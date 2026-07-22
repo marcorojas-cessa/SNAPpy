@@ -61,6 +61,30 @@ def test_stage1_normalization_handles_zero_mad_without_nan() -> None:
     assert np.array_equal(out, np.zeros_like(volume))
 
 
+def test_stage1_preprocessing_accepts_2d_physical_parameters_without_z_spacing() -> None:
+    y, x = np.indices((21, 21), dtype=np.float32)
+    image = (5.0 + np.exp(-(((y - 10.0) ** 2) + ((x - 10.0) ** 2)) / 8.0)).astype(np.float32)
+
+    out = preprocess.apply_preprocessing(
+        image,
+        {
+            "image_dimensionality": 2,
+            "xy_spacing_nm": 100.0,
+            "background_enabled": True,
+            "background_method": "rolling_box_2d",
+            "background_param_nm": 300.0,
+            "norm_enabled": True,
+            "norm_method": "robust_z_score",
+            "preproc_enabled": True,
+            "preproc_method": "gaussian",
+            "preproc_sigma_nm": 100.0,
+        },
+    )
+
+    assert out.shape == image.shape
+    assert np.all(np.isfinite(out))
+
+
 def test_slice_opening_2d_background_correction(monkeypatch) -> None:
     calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
 
@@ -211,6 +235,31 @@ def test_stage1_background_correction_converts_physical_box_radius_by_axis(monke
     )
 
     assert calls == [((3, 4, 5), (3, 7, 7))]
+    assert np.array_equal(out, np.ones_like(volume))
+
+
+def test_stage1_background_correction_uses_2d_rolling_box_slice_by_slice(monkeypatch) -> None:
+    calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+
+    def fake_grey_opening(image, size):
+        calls.append((image.shape, size))
+        return np.ones_like(image)
+
+    monkeypatch.setattr(preprocess.ndi, "grey_opening", fake_grey_opening)
+    volume = np.full((3, 4, 5), 2.0, dtype=np.float32)
+
+    out = preprocess._apply_background_correction(
+        volume,
+        {
+            "background_enabled": True,
+            "background_method": "rolling_box_2d",
+            "background_param_nm": 300.0,
+            "xy_spacing_nm": 100.0,
+            "z_spacing_nm": 300.0,
+        },
+    )
+
+    assert calls == [((4, 5), (7, 7)), ((4, 5), (7, 7)), ((4, 5), (7, 7))]
     assert np.array_equal(out, np.ones_like(volume))
 
 

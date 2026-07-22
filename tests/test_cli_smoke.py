@@ -53,6 +53,34 @@ def _write_native_accept_all_model(path):
     )
 
 
+def _write_native_accept_all_model_2d(path):
+    from mrsnappy.model import AcceptAllCandidatesModel, TrainedModel, save_model
+
+    recipe = {
+        "image_dimensionality": 2,
+        "preproc_enabled": False,
+        "background_enabled": False,
+        "maxima_method": "h_max",
+        "maxima_min_distance_nm": 1.0,
+        "h_max_sigma_multiplier": 0.1,
+        "h_max_sigma_mode": "std",
+        "fit_method": "2D Gaussian",
+        "fit_window": 7,
+        "xy_spacing_nm": 100.0,
+        "selected_features": ["integrated_intensity"],
+    }
+    save_model(
+        path,
+        TrainedModel(
+            model=AcceptAllCandidatesModel(),
+            selected_features=["integrated_intensity"],
+            best_params={"model_type": "stage1_pass_through"},
+            decision_threshold=0.0,
+            recipe=recipe,
+        ),
+    )
+
+
 def test_cli_init_config_writes_editable_default(tmp_path) -> None:
     config_path = tmp_path / "config.yaml"
     proc = subprocess.run(
@@ -351,6 +379,38 @@ def test_cli_detect_with_native_model_writes_detection_csv(tmp_path) -> None:
 
     df = pd.read_csv(output_path)
     assert list(df.columns) == ["detection_id", "x", "y", "z", "score"]
+
+
+def test_cli_detect_with_native_2d_model_writes_xy_detection_csv(tmp_path) -> None:
+    y, x = np.indices((21, 21), dtype=np.float32)
+    spot = np.exp(-(((y - 10.0) ** 2) / 4.0 + ((x - 11.0) ** 2) / 4.0))
+    image = (50.0 + 500.0 * spot).astype(np.float32)
+    image_path = tmp_path / "synthetic_spot_2d.tif"
+    output_path = tmp_path / "detections_2d.csv"
+    model_path = tmp_path / "model_2d.joblib"
+    tifffile.imwrite(image_path, image)
+    _write_native_accept_all_model_2d(model_path)
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mrsnappy.cli",
+            "detect",
+            "--model",
+            str(model_path),
+            "--input",
+            str(image_path),
+            "--output",
+            str(output_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    df = pd.read_csv(output_path)
+    assert list(df.columns) == ["detection_id", "x", "y", "score"]
 
 
 def test_cli_detect_requires_model_path(tmp_path) -> None:

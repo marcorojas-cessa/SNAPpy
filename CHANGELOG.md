@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0 - Native 2D Image Support
+
+This release adds first-class native 2D image support while preserving the
+existing 3D z-stack workflow and feature names.
+
+Highlights:
+
+- Adds dimensionality-aware image/label I/O for native 2D TIFFs and 2D ground
+  truth coordinates.
+- Adds standard axis-aligned `2D Gaussian` fitting and covariance-enabled
+  `Distorted 2D Gaussian` fitting, matching the naming convention used by the
+  3D fit modes.
+- Adds dimensional feature resolution so 2D models use area, boundary,
+  circularity, and 2D sigma-product names rather than 3D volume/surface names.
+- Omits z-derived features in 2D mode instead of filling them with placeholder
+  values.
+- Adds explicit `rolling_box_2d` background correction alongside the existing
+  `rolling_ball_2d`, while retaining the 3D background correction methods.
+- Expands tests for 2D preprocessing, fitting, feature packs, optimization
+  recipes, CLI behavior, and detection output schemas.
+
 ## 0.3.0 - Publication-Ready GitHub Release Candidate
 
 This release candidate contains the SNAPpy optimizer and model-output design

@@ -39,11 +39,11 @@ stage1_maxima_min_distances_nm: [300.0]
 # Used when stage1_detector_set is hmax.
 stage1_hmax_multipliers: [0.5, 1.0, 1.5, 2.0, 3.0]
 
-# 3D Gaussian smoothing sigmas in nanometers. The literal value off includes
+# Gaussian smoothing sigmas in nanometers. The literal value off includes
 # an unsmoothed Stage 1 recipe.
 stage1_smoothing_sigmas_nm: ["off", 64.433, 128.866, 257.732]
 
-# Expected: rolling_box_3d, slice_opening_2d, rolling_ball_2d, or rolling_ball_3d.
+# Expected: rolling_box_2d, rolling_box_3d, slice_opening_2d, rolling_ball_2d, or rolling_ball_3d.
 stage1_background_method: rolling_box_3d
 
 # Background radii in nanometers. The literal value off includes recipes
@@ -94,7 +94,11 @@ optimizer:
   max_stage2_recipes_after_shortlist: 100
 
 pipeline_defaults:
-  # Required physical voxel spacing used by real-distance preprocessing,
+  # Image dimensionality. Keep 3 for z-stacks. Set to 2 for native 2D images;
+  # in 2D mode z_spacing_nm is not used and z-derived features are omitted.
+  image_dimensionality: 3
+
+  # Required physical pixel/voxel spacing used by real-distance preprocessing,
   # physical matching, fitting-derived sigma features, and physical feature
   # measurements.
   # These defaults match the ch1/ch2/ch3 publication benchmark geometry.

@@ -58,12 +58,15 @@ _KERNEL_SIMPLICITY_RANK = {
     "poly": 2.0,
 }
 _FITTING_MODE_SIMPLICITY_RANK = {
+    "2d gaussian": 0.0,
+    "distorted 2d gaussian": 1.0,
     "2d (xy) + 1d (z) gaussian": 0.0,
     "3d gaussian": 1.0,
     "distorted 3d gaussian": 2.0,
 }
 _DEFAULT_FITTING_MODE = "2D (XY) + 1D (Z) Gaussian"
 _STAGE1_SCREEN_FIELDS = (
+    "image_dimensionality",
     "xy_spacing_nm",
     "z_spacing_nm",
     "preproc_enabled",
@@ -88,13 +91,23 @@ _STAGE1_SCREEN_FIELDS = (
 )
 
 
+def _cfg_image_dimensionality(cfg: dict[str, Any]) -> int:
+    try:
+        ndim = int(cfg.get("pipeline_defaults", {}).get("image_dimensionality", 3))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("pipeline_defaults.image_dimensionality must be either 2 or 3.") from exc
+    if ndim not in {2, 3}:
+        raise ValueError("pipeline_defaults.image_dimensionality must be either 2 or 3.")
+    return ndim
+
+
 def _match_distance_kwargs(cfg: dict[str, Any]) -> dict[str, Any]:
     """Return matching arguments for voxel or physical-distance matching."""
     if cfg.get("match_distance_nm") is None:
         return {"match_distance": float(cfg["match_distance"])}
     return {
         "match_distance": float(cfg["match_distance_nm"]),
-        "match_spacing_nm": spacing_zyx_nm(cfg.get("pipeline_defaults", {}), 3),
+        "match_spacing_nm": spacing_zyx_nm(cfg.get("pipeline_defaults", {}), _cfg_image_dimensionality(cfg)),
     }
 
 
@@ -105,12 +118,14 @@ def _match_distance_summary(cfg: dict[str, Any]) -> dict[str, Any]:
             "match_distance_units": "voxels",
             "match_distance_nm": None,
         }
-    spacing = spacing_zyx_nm(cfg.get("pipeline_defaults", {}), 3)
+    ndim = _cfg_image_dimensionality(cfg)
+    spacing = spacing_zyx_nm(cfg.get("pipeline_defaults", {}), ndim)
     return {
         "match_distance": float(cfg["match_distance_nm"]),
         "match_distance_units": "nm",
         "match_distance_nm": float(cfg["match_distance_nm"]),
         "match_spacing_zyx_nm": list(spacing),
+        "image_dimensionality": int(ndim),
     }
 
 
@@ -605,7 +620,7 @@ def _simplest_fitting_mode(stage1_recipe: dict[str, Any], cfg: dict[str, Any]) -
     elif default_value is not None:
         values.append(default_value)
     if not values:
-        values.append(_DEFAULT_FITTING_MODE)
+        values.append("2D Gaussian" if _cfg_image_dimensionality(cfg) == 2 else _DEFAULT_FITTING_MODE)
     return str(sorted(values, key=_fitting_mode_rank)[0])
 
 
@@ -1530,11 +1545,15 @@ def _safe_quantile(values: list[float], q: float) -> float:
 def _sample_gt_intensities(volume: np.ndarray, gt: np.ndarray) -> list[float]:
     if len(gt) == 0:
         return []
+    if gt.ndim != 2 or gt.shape[1] != volume.ndim:
+        raise ValueError(
+            "Ground-truth point dimensionality does not match image dimensionality: "
+            f"points have shape {gt.shape}, image has ndim={volume.ndim}."
+        )
     idx = np.rint(gt).astype(np.int64)
-    idx[:, 0] = np.clip(idx[:, 0], 0, volume.shape[0] - 1)
-    idx[:, 1] = np.clip(idx[:, 1], 0, volume.shape[1] - 1)
-    idx[:, 2] = np.clip(idx[:, 2], 0, volume.shape[2] - 1)
-    return volume[idx[:, 0], idx[:, 1], idx[:, 2]].astype(np.float32).tolist()
+    for axis in range(volume.ndim):
+        idx[:, axis] = np.clip(idx[:, axis], 0, volume.shape[axis] - 1)
+    return volume[tuple(idx[:, axis] for axis in range(volume.ndim))].astype(np.float32).tolist()
 
 
 def _profile_dataset(cfg: dict[str, Any]) -> dict[str, Any]:

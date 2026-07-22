@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mrsnappy"
-version = "0.3.0"
-description = "3D fluorescent puncta detection for microscopy z-stacks."
+version = "0.4.0"
+description = "Fluorescent puncta detection for 2D microscopy images and 3D z-stacks."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

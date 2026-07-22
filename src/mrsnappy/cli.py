@@ -11,7 +11,7 @@ from .api import detect, init_config, optimize, optimize_dry_run
 def parse_args() -> argparse.Namespace:
     argv = sys.argv[1:]
 
-    parser = argparse.ArgumentParser(prog="mrsnappy", description="SNAPpy 3D fluorescent puncta detection")
+    parser = argparse.ArgumentParser(prog="mrsnappy", description="SNAPpy 2D/3D fluorescent puncta detection")
     sub = parser.add_subparsers(dest="command", required=True)
 
     init_config = sub.add_parser("init-config", help="Write an editable default optimizer config.")
